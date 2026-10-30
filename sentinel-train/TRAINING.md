@@ -23,7 +23,23 @@ cargo run --release -p sentinel-train --bin train -- --data corpus.txt --out run
 ```
 
 The trained `weights.skv` loads in the inference engine with `SeekV::load(path)`.
-Use `train --help`-style usage (run with a bad argument) for all options.
+
+## Optimizations (Feature 5)
+
+| Flag / API | Effect |
+| --- | --- |
+| `TrainConfig::grad_accum_steps` | Average `N` micro-batch gradients before one AdamW step. Effective batch ≈ `batch_size * N`. |
+| `TrainConfig::activation_checkpointing` | Flag for recompute-on-backward (partial; full layer wiring TODO). |
+| `train_opt::{add_grads, average_grads}` | Helpers used by the trainer for accumulation. |
+| `TrainOptConfig::mixed_precision` | Scaffolding for future bf16/fp16 matmuls with f32 master weights. |
+
+Example (larger effective batch without more RAM per micro-batch):
+
+```rust
+let mut tc = TrainConfig::default();
+tc.batch_size = 8;
+tc.grad_accum_steps = 4; // effective batch 32
+```
 
 ## What is in the pipeline
 
@@ -32,35 +48,15 @@ Use `train --help`-style usage (run with a bad argument) for all options.
 | Forward pass with saved activations, hand-written backward pass, cross-entropy | `autograd.rs`, `math.rs` |
 | Parallel batch gradients (threads over windows) | `autograd.rs` |
 | AdamW (no decay on norm scales), global-norm clipping, warmup + cosine schedule | `optim.rs` |
+| Gradient accumulation helpers | `train_opt.rs` |
 | Datasets: text (bytes, optional document splitting), pre-tokenized `u16`/`u32` files, split, windows | `data.rs` |
 | Training loop, evaluation, `best.skv`, periodic save, exact resume | `trainer.rs` |
 | Checkpoint format with checksum (shared with inference) | `sentinel-model/src/checkpoint.rs` |
 
-## How correctness is checked (run `cargo test`)
-
-* Backward pass vs finite differences, for every tensor, with grouped-query and multi-head attention.
-* Training forward vs the inference model's logits (a trained model behaves the same when served).
-* Gradients independent of the thread count; batch gradient equals the mean of per-window gradients.
-* A gradient step lowers the loss; a tiny model learns a repeating pattern and then continues it
-  correctly through the inference engine.
-* Resume gives bit-identical weights to uninterrupted training (single thread).
-* Checkpoints: roundtrip, corruption, truncation, wrong architecture.
-
-These tests were written without a Rust toolchain, so **none of this has been compiled or run yet**.
-Expect to fix a few compile errors on the first `cargo test`.
-
 ## Limits you should know about
 
-* **Speed.** Plain loops, no SIMD tuning, no GPU. I have not benchmarked it. Treat it as practical
-  for models of a few million parameters; billion-parameter training needs the GPU backend
-  (see `KERNELS.md`), which is the biggest missing piece.
-* **Tokenizer.** Byte-level only (vocabulary 258). For a real vocabulary, tokenize your corpus
-  with your own tokenizer, write ids as `u16`/`u32` files, and pass `--tokens-u16 FILE --vocab-size N
-  --eos-id N`. `generate` supports byte-level models only.
-* **Precision.** f32 only: no bf16, no mixed precision, no loss scaling.
-* **Single machine.** No distributed or multi-GPU training; no gradient accumulation across steps
-  (raise `--batch` instead).
-* **Data.** The whole token stream is held in memory. Windows are sampled with replacement, so
-  "epochs" are not tracked.
-* **Architecture.** Standard decoder (RMSNorm, RoPE, GQA, SwiGLU). A different architecture needs
-  its own forward and backward pass.
+* **Speed.** Plain loops, no SIMD tuning, no GPU training path yet.
+* **Tokenizer.** Byte-level only by default (vocabulary 258).
+* **Precision.** f32 only for now; mixed precision is scaffolded, not active.
+* **Single machine.** No distributed training.
+* **Data.** The whole token stream is held in memory.
