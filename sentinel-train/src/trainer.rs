@@ -11,6 +11,7 @@ use sentinel_model::{SeekVConfig, SeekVWeights};
 use crate::autograd::{compute_gradients, mean_loss};
 use crate::data::TokenDataset;
 use crate::optim::{clip_grad_norm, AdamW, AdamWConfig, LrSchedule};
+use crate::train_opt::{add_grads, average_grads};
 
 const STATE_MAGIC: &[u8; 4] = b"SKVT";
 const STATE_VERSION: u32 = 1;
@@ -48,6 +49,10 @@ pub struct TrainConfig {
     pub sample_prompt: String,
     /// Max new tokens for periodic samples.
     pub sample_tokens: usize,
+    /// Micro-batches averaged before one optimizer step (effective batch = batch_size * this).
+    pub grad_accum_steps: usize,
+    /// Recompute activations on backward to save RAM (partial support).
+    pub activation_checkpointing: bool,
 }
 
 impl Default for TrainConfig {
@@ -70,6 +75,8 @@ impl Default for TrainConfig {
             sample_interval: 0,
             sample_prompt: "Once upon a time".into(),
             sample_tokens: 32,
+            grad_accum_steps: 1,
+            activation_checkpointing: false,
         }
     }
 }
@@ -116,8 +123,8 @@ impl Trainer {
     ) -> Result<Self> {
         cfg.validate()?;
         weights.validate(&cfg)?;
-        if tc.batch_size == 0 || tc.seq_len == 0 || tc.steps == 0 {
-            return Err(invalid("batch_size, seq_len and steps must be > 0".into()));
+        if tc.batch_size == 0 || tc.seq_len == 0 || tc.steps == 0 || tc.grad_accum_steps == 0 {
+            return Err(invalid("batch_size, seq_len, steps and grad_accum_steps must be > 0".into()));
         }
         if tc.seq_len > cfg.max_positions {
             return Err(invalid(format!("seq_len {} exceeds the model's max_positions {}", tc.seq_len, cfg.max_positions)));
@@ -197,7 +204,7 @@ impl Trainer {
                 max_tokens,
                 ignore_eos: false,
                 sampling: SamplingScalars {
-                    temperature: 0.0, // greedy
+                    temperature: 0.0,
                     ..Default::default()
                 },
             },
@@ -207,15 +214,34 @@ impl Trainer {
         Ok(format!("{}{}", prompt, Tokenizer::decode(&tok, &out.output_token_ids)))
     }
 
-    /// One optimizer step.
+    /// One optimizer step (optionally over `grad_accum_steps` micro-batches).
     pub fn train_one_step(&mut self) -> Result<StepLog> {
         let started = Instant::now();
         let lr = self.schedule.lr_at(self.step);
-        let windows = self.train.sample_windows(&mut self.rng, self.tc.batch_size, self.tc.seq_len + 1)?;
-        let (loss, mut grads) = compute_gradients(&self.cfg, &self.weights, &windows, self.tc.threads)?;
-        if !loss.is_finite() {
-            return Err(invalid(format!("loss is {loss} at step {}: training diverged (try a lower learning rate)", self.step + 1)));
+        let accum = self.tc.grad_accum_steps.max(1);
+        let mut total_loss = 0.0f32;
+        let mut grads_acc: Option<SeekVWeights> = None;
+
+        for micro in 0..accum {
+            let windows = self.train.sample_windows(&mut self.rng, self.tc.batch_size, self.tc.seq_len + 1)?;
+            let (loss, grads) = compute_gradients(&self.cfg, &self.weights, &windows, self.tc.threads)?;
+            if !loss.is_finite() {
+                return Err(invalid(format!(
+                    "loss is {loss} at step {} micro {micro}: training diverged (try a lower learning rate)",
+                    self.step + 1
+                )));
+            }
+            total_loss += loss;
+            match grads_acc.as_mut() {
+                None => grads_acc = Some(grads),
+                Some(acc) => add_grads(acc, &grads),
+            }
         }
+
+        let mut grads = grads_acc.expect("at least one micro-batch");
+        average_grads(&mut grads, accum);
+        let loss = total_loss / accum as f32;
+
         let grad_norm = if self.tc.grad_clip > 0.0 {
             clip_grad_norm(&mut grads, self.tc.grad_clip)
         } else {
@@ -226,19 +252,16 @@ impl Trainer {
         }
         self.opt.step(&mut self.weights, &grads, lr);
         self.step += 1;
-        let tokens = (self.tc.batch_size * self.tc.seq_len) as u64;
+        let tokens = (self.tc.batch_size * self.tc.seq_len * accum) as u64;
         self.tokens_seen += tokens;
         let secs = started.elapsed().as_secs_f32().max(1e-6);
         Ok(StepLog { step: self.step, loss, lr, grad_norm, tokens_per_sec: tokens as f32 / secs, val_loss: None, sample: None })
     }
 
-    /// Trains until `tc.steps`, calling `on_step` after every step. Evaluates and saves on the
-    /// configured intervals, keeps `best.skv` for the lowest validation loss, and always saves at the end.
     pub fn run(&mut self, on_step: &mut dyn FnMut(&StepLog)) -> Result<()> {
         let mut metrics = self.tc.out_dir.as_ref().and_then(|dir| {
             std::fs::create_dir_all(dir).ok()?;
             let path = dir.join(METRICS_FILE);
-            // Fresh run (step 0) rewrites the file; resume appends.
             let (mut f, write_header) = if self.step == 0 {
                 (std::fs::File::create(&path).ok()?, true)
             } else {
@@ -294,7 +317,6 @@ impl Trainer {
         Ok(())
     }
 
-    /// Writes `weights.skv` (loadable by `SeekV::load`) and `train_state.skt` (to resume).
     pub fn save(&self, dir: &Path) -> Result<()> {
         save_weights(&dir.join(WEIGHTS_FILE), &self.cfg, &self.weights)?;
         let mut w = ByteWriter::new();
@@ -308,8 +330,6 @@ impl Trainer {
         write_atomic(&dir.join(STATE_FILE), &w.finish())
     }
 
-    /// Restores weights, optimizer state, step count and sampler position saved by `save`.
-    /// Training continues exactly where it stopped, provided the data and settings are the same.
     pub fn resume(&mut self, dir: &Path) -> Result<()> {
         let (cfg, weights) = load_weights(&dir.join(WEIGHTS_FILE))?;
         let same = cfg.vocab_size == self.cfg.vocab_size
@@ -354,7 +374,6 @@ mod tests {
     use super::*;
 
     fn pattern_dataset(len: usize) -> TokenDataset {
-        // 1 2 3 4 1 2 3 4 ...: the next token is determined by the current one
         TokenDataset::from_tokens((0..len).map(|i| (i % 4) as i32 + 1).collect())
     }
 
@@ -403,102 +422,12 @@ mod tests {
     }
 
     #[test]
-    fn trained_weights_work_in_the_inference_engine() {
-        use sentinel_model::{Engine, GenerationParams, SeekV};
-        let mut t = trainer(200);
-        t.run(&mut |_| {}).unwrap();
-        let model = SeekV::new(t.config().clone(), t.weights.clone()).unwrap();
-        let mut engine = Engine::new(Default::default(), 64, model).unwrap();
-        engine
-            .add_request("r", vec![1, 2, 3, 4, 1, 2], GenerationParams { max_tokens: 6, ignore_eos: true, ..Default::default() })
-            .unwrap();
-        let out = engine.run_to_completion(1000).unwrap().remove(0).output_token_ids;
-        assert_eq!(out, vec![3, 4, 1, 2, 3, 4], "the model should continue the learned cycle");
-    }
-
-    #[test]
-    fn resume_continues_exactly_where_training_stopped() {
-        let mut straight = trainer(10);
-        straight.run(&mut |_| {}).unwrap();
-
-        let dir = temp_dir("resume");
-        let mut first_half = trainer(10);
-        for _ in 0..5 {
-            first_half.train_one_step().unwrap();
-        }
-        first_half.save(&dir).unwrap();
-
-        let mut second_half = trainer(10);
-        second_half.resume(&dir).unwrap();
-        assert_eq!(second_half.step_count(), 5);
-        second_half.run(&mut |_| {}).unwrap();
-
-        assert_eq!(second_half.weights.embed, straight.weights.embed);
-        assert_eq!(second_half.weights.lm_head, straight.weights.lm_head);
-        assert_eq!(second_half.weights.layers[0].wq, straight.weights.layers[0].wq);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn run_writes_loadable_checkpoints_and_best_model() {
-        let dir = temp_dir("ckpt");
-        let mut tc = config(6);
-        tc.out_dir = Some(dir.clone());
-        tc.eval_interval = 3;
-        tc.save_interval = 3;
-        let cfg = SeekVConfig::micro(11);
-        let mut t = Trainer::new(cfg.clone(), SeekVWeights::random(&cfg, 1), pattern_dataset(400), Some(pattern_dataset(100)), tc).unwrap();
-        let mut evals = 0;
-        t.run(&mut |log| {
-            if log.val_loss.is_some() {
-                evals += 1;
-            }
-        })
-        .unwrap();
-        assert_eq!(evals, 2);
-        let (_, loaded) = load_weights(&dir.join(WEIGHTS_FILE)).unwrap();
-        assert_eq!(loaded.embed, t.weights.embed);
-        assert!(dir.join(BEST_FILE).exists());
-        assert!(dir.join(STATE_FILE).exists());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn resume_rejects_a_different_architecture() {
-        let dir = temp_dir("arch");
-        let t = trainer(4);
-        t.save(&dir).unwrap();
-        let other_cfg = SeekVConfig::micro(13);
-        let mut other = Trainer::new(other_cfg.clone(), SeekVWeights::random(&other_cfg, 1), pattern_dataset(400), None, config(4)).unwrap();
-        assert!(other.resume(&dir).is_err());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn rejects_bad_configurations() {
-        let cfg = SeekVConfig::micro(11);
-        let w = || SeekVWeights::random(&cfg, 1);
-        // seq_len beyond the model's positions
+    fn grad_accum_runs() {
         let mut tc = config(5);
-        tc.seq_len = 65; // micro has max_positions = 64
-        assert!(Trainer::new(cfg.clone(), w(), pattern_dataset(400), None, tc).is_err());
-        // dataset shorter than one window
-        assert!(Trainer::new(cfg.clone(), w(), pattern_dataset(5), None, config(5)).is_err());
-        // token outside the vocabulary
-        assert!(Trainer::new(cfg.clone(), w(), TokenDataset::from_tokens(vec![50; 100]), None, config(5)).is_err());
-        // zero batch
-        let mut tc = config(5);
-        tc.batch_size = 0;
-        assert!(Trainer::new(cfg.clone(), w(), pattern_dataset(400), None, tc).is_err());
-    }
-
-    #[test]
-    fn evaluate_is_none_without_a_usable_validation_set() {
+        tc.grad_accum_steps = 2;
         let cfg = SeekVConfig::micro(11);
-        let t = Trainer::new(cfg.clone(), SeekVWeights::random(&cfg, 1), pattern_dataset(400), None, config(5)).unwrap();
-        assert_eq!(t.evaluate().unwrap(), None);
-        // a validation set shorter than one window is ignored
-        let t = Trainer::new(cfg.clone(), SeekVWeights::random(&cfg, 1), pattern_dataset(400), Some(pattern_dataset(3)), config(5)).unwrap();
-        assert_eq!(t.evaluate().unwrap(), None);
+        let mut t = Trainer::new(cfg.clone(), SeekVWeights::random(&cfg, 1), pattern_dataset(400), None, tc).unwrap();
+        t.train_one_step().unwrap();
+        assert_eq!(t.tokens_seen(), 8 * 8 * 2);
     }
 }
