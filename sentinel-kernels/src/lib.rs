@@ -102,20 +102,32 @@ enum Kind {
 /// Single kernel engine for Seek-V research and production paths.
 pub struct SeekKernels {
     kind: Kind,
+    rope_theta: f32,
+    rms_eps: f32,
 }
 
 impl SeekKernels {
     pub fn cpu() -> Self {
-        Self { kind: Kind::Cpu(CpuBackend) }
+        Self { kind: Kind::Cpu(CpuBackend), rope_theta: 10000.0, rms_eps: 1e-5 }
     }
 
     pub fn parallel() -> Self {
-        Self { kind: Kind::Parallel(ParallelCpuBackend) }
+        Self { kind: Kind::Parallel(ParallelCpuBackend), rope_theta: 10000.0, rms_eps: 1e-5 }
     }
 
     /// Prefer CUDA, then OpenCL, else parallel CPU.
     pub fn gpu() -> Self {
-        Self { kind: Kind::Gpu(GpuBackend::new()) }
+        Self { kind: Kind::Gpu(GpuBackend::new()), rope_theta: 10000.0, rms_eps: 1e-5 }
+    }
+
+    pub fn with_rope_theta(mut self, theta: f32) -> Self {
+        self.rope_theta = theta;
+        self
+    }
+
+    pub fn with_rms_eps(mut self, eps: f32) -> Self {
+        self.rms_eps = eps;
+        self
     }
 
     pub fn name(&self) -> &'static str {
@@ -124,5 +136,9 @@ impl SeekKernels {
             Kind::Parallel(b) => b.name(),
             Kind::Gpu(b) => b.name(),
         }
+    }
+
+    pub fn is_accelerated(&self) -> bool {
+        matches!(&self.kind, Kind::Gpu(b) if b.is_device_accelerated())
     }
 }
