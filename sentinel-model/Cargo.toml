@@ -1,0 +1,11 @@
+[package]
+name = "sentinel-model"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "Apache-2.0"
+description = "Seek-V model, sampler and engine loop for Sentinel"
+
+[dependencies]
+sentinel-core = { path = ".." }
+sentinel-kernels = { path = "../sentinel-kernels" }
