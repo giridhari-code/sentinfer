@@ -1,0 +1,18 @@
+[package]
+name = "sentinel-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "Apache-2.0"
+description = "Sentinel: high-performance LLM inference engine core (Rust port, phase 1: block manager, sequences, scheduler)"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[workspace]
+members = ["sentinel-kernels", "sentinel-model", "sentinel-train", "sentinel-serve"]

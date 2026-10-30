@@ -1,0 +1,6 @@
+Sentinel (sentinel-core)
+
+This project is a derivative work of DeepInfer (https://github.com/deepseek-ai/DeepInfer),
+Copyright DeepSeek-AI, licensed under the Apache License, Version 2.0.
+The engine logic in src/block_manager.rs, src/sequence.rs and src/scheduler.rs is a Rust
+port of csrc/engine/{block_manager,sequence,scheduler}.hpp from that project.
