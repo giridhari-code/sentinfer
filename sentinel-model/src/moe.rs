@@ -1,36 +1,26 @@
 //! Mixture-of-Experts FFN for Seek-V (DeepInfer / DeepSeek-style sparse MLP).
 //!
-//! Architecture:
-//! * **Router** — linear `hidden → num_experts`, softmax, top-k selection.
-//! * **Experts** — independent SwiGLU FFNs (`w_gate`, `w_up`, `w_down`).
-//! * **Combine** — weighted sum of selected expert outputs.
-//!
-//! **DeepGEMM-inspired packing:** tokens routed to the same expert are packed into a
-//! contiguous batch so one `matmul_nt` serves many tokens (better than per-token GEMM).
-//! Full CUDA DeepGEMM is not vendored; this is the algorithmic equivalent on our kernels.
-//!
-//! **EP / EPLB:** expert-parallel sharding and load-balance are not implemented yet;
-//! `ExpertParallelConfig` holds the future knobs.
+//! * Router: linear hidden → num_experts, softmax, top-k
+//! * Experts: SwiGLU FFNs
+//! * DeepGEMM-style: pack tokens per expert for batched matmul_nt
+//! * EP/EPLB: scaffolding only (`ExpertParallelConfig`)
+
+use std::cmp::Ordering;
 
 use sentinel_core::{Result, SentinelError};
 use sentinel_kernels::reference as kern;
 
 use crate::ops::kerr;
 
-/// Expert-parallel / load-balance scaffolding (DeepInfer EPLB).
 #[derive(Debug, Clone, Default)]
 pub struct ExpertParallelConfig {
-    /// Number of expert-parallel ranks (1 = no EP).
     pub ep_size: usize,
-    /// Enable expert load-balance metrics / future EPLB.
     pub enable_eplb: bool,
 }
 
-/// MoE hyperparameters.
 #[derive(Debug, Clone)]
 pub struct MoEConfig {
     pub num_experts: usize,
-    /// How many experts each token activates (top-k).
     pub top_k: usize,
     pub intermediate_size: usize,
     pub hidden_size: usize,
@@ -55,7 +45,6 @@ impl MoEConfig {
     }
 }
 
-/// One SwiGLU expert.
 #[derive(Debug, Clone)]
 pub struct ExpertWeights {
     pub w_gate: Vec<f32>,
@@ -163,11 +152,7 @@ fn softmax_rows(logits: &mut [f32], rows: usize, cols: usize) {
 
 fn top_k_row(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut idx: Vec<usize> = (0..scores.len()).collect();
-    idx.sort_by(|&a, &b| {
-        scores[b]
-            .partial_cmp(&scores[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(Ordering::equal));
     idx.truncate(k);
     let sum: f32 = idx.iter().map(|&i| scores[i]).sum();
     let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
@@ -177,13 +162,11 @@ fn top_k_row(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
 pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
     moe.validate()?;
     let cfg = &moe.cfg;
-    let (t, d, e, k, inter) = (
-        x.len() / cfg.hidden_size,
-        cfg.hidden_size,
-        cfg.num_experts,
-        cfg.top_k,
-        cfg.intermediate_size,
-    );
+    let t = x.len() / cfg.hidden_size;
+    let d = cfg.hidden_size;
+    let e = cfg.num_experts;
+    let k = cfg.top_k;
+    let inter = cfg.intermediate_size;
     if x.len() != t * d {
         return Err(SentinelError::InvalidState("moe_ffn: x length not divisible by hidden".into()));
     }
@@ -193,8 +176,7 @@ pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
 
     let mut choices: Vec<Vec<(usize, f32)>> = Vec::with_capacity(t);
     for row in 0..t {
-        let scores = &router_logits[row * e..(row + 1) * e];
-        choices.push(top_k_row(scores, k));
+        choices.push(top_k_row(&router_logits[row * e..(row + 1) * e], k));
     }
 
     let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); e];
@@ -270,10 +252,9 @@ mod tests {
             ep: Default::default(),
         };
         let moe = MoEWeights::random(&cfg, 7).unwrap();
-        let t = 3;
-        let x = vec![0.1f32; t * cfg.hidden_size];
+        let x = vec![0.1f32; 3 * cfg.hidden_size];
         let y = moe_ffn(&x, &moe).unwrap();
-        assert_eq!(y.len(), t * cfg.hidden_size);
+        assert_eq!(y.len(), 3 * cfg.hidden_size);
         assert!(y.iter().all(|v| v.is_finite()));
     }
 }
