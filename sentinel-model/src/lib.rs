@@ -24,8 +24,8 @@ pub use engine::{Engine, FinishedRequest, GenerationParams};
 pub use llm::{Llm, StreamDelta};
 pub use model::{Model, StepInput};
 pub use moe::{
-    dense_swiglu, dense_swiglu_kernels, moe_ffn, moe_ffn_kernels, ExpertParallelConfig,
-    ExpertWeights, MoEConfig, MoEWeights,
+    dense_swiglu, dense_swiglu_kernels, moe_ffn, moe_ffn_cached, moe_ffn_kernels, ExpertParallelConfig,
+    ExpertWeights, MoEConfig, MoEGpuCache, MoEWeights,
 };
 pub use mtp_decode::{greedy_token, propose_drafts, verify_drafts, VerifyResult};
 pub use quantized::{quantize_checkpoint, QuantizedSeekV};
