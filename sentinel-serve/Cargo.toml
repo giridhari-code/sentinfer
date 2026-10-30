@@ -1,0 +1,23 @@
+[package]
+name = "sentinel-serve"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "Apache-2.0"
+description = "kLLM: full-Rust cross-platform Seek-V inference server"
+
+[[bin]]
+name = "kllm"
+path = "src/main.rs"
+
+[[bin]]
+name = "kllm-worker"
+path = "src/bin/kllm-worker.rs"
+
+[[bin]]
+name = "kllm-coord"
+path = "src/bin/kllm-coord.rs"
+
+[dependencies]
+sentinel-model = { path = "../sentinel-model" }
+sentinel-kernels = { path = "../sentinel-kernels" }
