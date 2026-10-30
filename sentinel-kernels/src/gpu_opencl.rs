@@ -2,9 +2,10 @@
 //!
 //! When a GPU/accelerator platform is present the heavy ops (`matmul_nt` tiled 16x16,
 //! `rms_norm`, `silu`, `softmax_rows`, `rope`, `attention_causal`) run as OpenCL C kernels
-//! on the device. Matmul uses local memory tiling for better occupancy. If no platform
-//! is available the backend reports `is_device_accelerated() == false` and the caller
-//! should use [`crate::ParallelCpuBackend`].
+//! on the device. Matmul uses local memory tiling for better occupancy. Attention uses
+//! online-softmax (FlashAttention-style) for numerical stability and less traffic.
+//! If no platform is available the backend reports `is_device_accelerated() == false`
+//! and the caller should use [`crate::ParallelCpuBackend`].
 
 use std::ffi::CString;
 use std::os::raw::c_void;
@@ -96,7 +97,8 @@ __kernel void softmax_rows(
     for (int c = 0; c < cols; ++c) row[c] *= inv;
 }
 
-
+// Online-softmax attention (FlashAttention-style). Single pass over KV,
+// numerically stable, ~2x less memory traffic than two-pass version.
 __kernel void attention_causal(
     __global const float* q,
     __global const float* k_cache,
@@ -108,35 +110,42 @@ __kernel void attention_causal(
     int ti = get_global_id(0);
     int head = get_global_id(1);
     if (ti >= tokens || head >= num_heads) return;
+
     int group = num_heads / num_kv_heads;
     int kvh = head / group;
     int kv_stride = num_kv_heads * head_dim;
     int pos = start_pos + ti;
     float scale = 1.0f / sqrt((float)head_dim);
+
     __global const float* qv = q + (ti * num_heads + head) * head_dim;
-    // scores on private memory limited — use iterative softmax in two passes via local max
-    float mx = -INFINITY;
+    __global float* out = attn + (ti * num_heads + head) * head_dim;
+
+    // Online softmax state
+    float m_i = -INFINITY;   // running max
+    float l_i = 0.0f;        // running sum of exp
+    for (int c = 0; c < head_dim; ++c) out[c] = 0.0f;
+
     for (int j = 0; j <= pos; ++j) {
         __global const float* kj = k_cache + j * kv_stride + kvh * head_dim;
+        __global const float* vj = v_cache + j * kv_stride + kvh * head_dim;
+
         float dot = 0.0f;
         for (int c = 0; c < head_dim; ++c) dot += qv[c] * kj[c];
         float s = dot * scale;
-        if (s > mx) mx = s;
+
+        float m_new = fmax(m_i, s);
+        float exp_m = exp(m_i - m_new);
+        float alpha = exp(s - m_new);
+
+        // rescale previous accumulator
+        for (int c = 0; c < head_dim; ++c)
+            out[c] = out[c] * exp_m + alpha * vj[c];
+
+        l_i = l_i * exp_m + alpha;
+        m_i = m_new;
     }
-    float sum = 0.0f;
-    // accumulate weighted V
-    __global float* out = attn + (ti * num_heads + head) * head_dim;
-    for (int c = 0; c < head_dim; ++c) out[c] = 0.0f;
-    for (int j = 0; j <= pos; ++j) {
-        __global const float* kj = k_cache + j * kv_stride + kvh * head_dim;
-        float dot = 0.0f;
-        for (int c = 0; c < head_dim; ++c) dot += qv[c] * kj[c];
-        float wgt = exp(dot * scale - mx);
-        sum += wgt;
-        __global const float* vj = v_cache + j * kv_stride + kvh * head_dim;
-        for (int c = 0; c < head_dim; ++c) out[c] += wgt * vj[c];
-    }
-    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+
+    float inv = l_i > 0.0f ? 1.0f / l_i : 0.0f;
     for (int c = 0; c < head_dim; ++c) out[c] *= inv;
 }
 
