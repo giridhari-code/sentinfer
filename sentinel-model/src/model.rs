@@ -23,4 +23,7 @@ pub trait Model {
     fn forward(&mut self, batch: &[StepInput<'_>]) -> Result<Vec<f32>>;
     /// Drops all cached state of a finished or aborted sequence.
     fn release(&mut self, seq_id: SeqId);
+    /// Truncate per-sequence KV cache to `len` positions (for MTP draft rollback).
+    /// Default: no-op (models without mutable KV ignore this).
+    fn truncate(&mut self, _seq_id: SeqId, _len: usize) {}
 }
