@@ -6,9 +6,13 @@
 //! * `optim`: AdamW, gradient clipping, warmup + cosine learning-rate schedule.
 //! * `data`: token datasets, window sampling, train/validation split.
 //! * `trainer`: the training loop with evaluation, checkpointing and resume.
+//! * `train_opt`: gradient accumulation helpers, future mixed-precision / checkpointing flags.
 
 pub mod autograd;
 pub mod data;
 pub mod math;
 pub mod optim;
+pub mod train_opt;
 pub mod trainer;
+
+pub use train_opt::{add_grads, average_grads, scale_grads, TrainOptConfig};
