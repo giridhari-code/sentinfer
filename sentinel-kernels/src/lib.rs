@@ -1,11 +1,10 @@
 //! # SeekKernels
 //!
-//! Unified kernel surface for Seek-V: device → layer → forward.
+//! Unified kernel surface for Seek-V.
 //!
-//! ```ignore
-//! let k = SeekKernels::auto(); // CUDA → OpenCL → parallel CPU
-//! let y = k.layer(&x, &weights, &mut kv, dims, rope_theta)?;
-//! ```
+//! * [`SeekKernels::auto`] — CUDA → OpenCL → parallel CPU
+//! * [`SeekKernels::layer_with_rope`] — one decoder block on the selected backend
+//! * [`SeekKernels::gemm`] — matmul for lm_head / projections
 
 pub mod backend;
 pub(crate) mod conformance;
@@ -32,9 +31,8 @@ use backend::Backend as _;
 use cpu::CpuBackend;
 use gpu::GpuBackend as Gpu;
 use parallel_cpu::ParallelCpuBackend;
-use pipeline::{run_forward, run_layer_backend, LayerWeightsView, PipelineDims};
+use pipeline::{run_layer_backend, LayerWeightsView, PipelineDims};
 
-/// Borrowed weights for one decoder block (`matmul_nt` layout `[out, in]`).
 pub struct LayerWeights<'a> {
     pub attn_norm: &'a [f32],
     pub wq: &'a [f32],
@@ -63,7 +61,6 @@ impl<'a> LayerWeights<'a> {
     }
 }
 
-/// Step geometry for layer / forward.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelDims {
     pub tokens: usize,
@@ -99,7 +96,6 @@ enum Kind {
     Gpu(Gpu),
 }
 
-/// Single kernel engine for Seek-V.
 pub struct SeekKernels {
     kind: Kind,
 }
@@ -112,37 +108,27 @@ impl Default for SeekKernels {
 
 impl SeekKernels {
     pub fn cpu() -> Self {
-        Self {
-            kind: Kind::Cpu(CpuBackend),
-        }
+        Self { kind: Kind::Cpu(CpuBackend) }
     }
 
     pub fn parallel() -> Self {
-        Self {
-            kind: Kind::Parallel(ParallelCpuBackend),
-        }
+        Self { kind: Kind::Parallel(ParallelCpuBackend) }
     }
 
-    /// Force GPU backend (CUDA → OpenCL → CPU fallback inside GpuBackend).
     pub fn gpu() -> Self {
-        Self {
-            kind: Kind::Gpu(GpuBackend::new()),
-        }
+        Self { kind: Kind::Gpu(GpuBackend::new()) }
     }
 
-    /// Prefer real GPU when available; otherwise parallel CPU.
+    /// CUDA → OpenCL → parallel CPU.
     pub fn auto() -> Self {
         let g = GpuBackend::new();
         if g.is_device_accelerated() {
-            Self {
-                kind: Kind::Gpu(g),
-            }
+            Self { kind: Kind::Gpu(g) }
         } else {
             Self::parallel()
         }
     }
 
-    /// Compatibility no-ops (rope/eps come from ModelDims + layer args).
     pub fn with_rope_theta(self, _theta: f32) -> Self {
         self
     }
@@ -159,10 +145,7 @@ impl SeekKernels {
     }
 
     pub fn is_accelerated(&self) -> bool {
-        match &self.kind {
-            Kind::Gpu(b) => b.is_device_accelerated(),
-            _ => false,
-        }
+        matches!(&self.kind, Kind::Gpu(b) if b.is_device_accelerated())
     }
 
     pub fn accel_kind(&self) -> Option<&'static str> {
@@ -172,7 +155,7 @@ impl SeekKernels {
         }
     }
 
-    /// One decoder layer. Updates `x` in place via backend path (GPU when accelerated).
+    /// One decoder layer on the active backend (GPU when available).
     pub fn layer(
         &self,
         x: &mut [f32],
@@ -180,10 +163,6 @@ impl SeekKernels {
         weights: &LayerWeights<'_>,
         kv: &mut LayerKvCache,
     ) -> Result<()> {
-        let pd: PipelineDims = dims.into();
-        let view = weights.view();
-        // rope_theta: conventional default; Seek-V passes via dims path by storing on model.
-        // Callers that need custom theta use `layer_with_rope`.
         self.layer_with_rope(x, dims, weights, kv, 10000.0)
     }
 
@@ -204,38 +183,12 @@ impl SeekKernels {
         }
     }
 
-    /// GEMM `out = x @ W^T` with shapes x:[m,k], W:[n,k], out:[m,n].
+    /// `out[m,n] = x[m,k] @ W[n,k]^T`
     pub fn gemm(&self, x: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         match &self.kind {
             Kind::Cpu(b) => b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n),
             Kind::Parallel(b) => b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n),
             Kind::Gpu(b) => b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n),
-        }
-    }
-
-    pub fn forward(
-        &self,
-        tokens: &[i32],
-        layers: &[LayerWeights<'_>],
-        embed: &[f32],
-        final_norm: &[f32],
-        lm_head: &[f32],
-        kv: &mut [LayerKvCache],
-        dims: ModelDims,
-        rope_theta: f32,
-    ) -> Result<Vec<f32>> {
-        let pd: PipelineDims = dims.into();
-        let views: Vec<_> = layers.iter().map(|w| w.view()).collect();
-        match &self.kind {
-            Kind::Cpu(b) => {
-                run_forward(b, tokens, &views, embed, final_norm, lm_head, kv, pd, rope_theta)
-            }
-            Kind::Parallel(b) => {
-                run_forward(b, tokens, &views, embed, final_norm, lm_head, kv, pd, rope_theta)
-            }
-            Kind::Gpu(b) => {
-                run_forward(b, tokens, &views, embed, final_norm, lm_head, kv, pd, rope_theta)
-            }
         }
     }
 }
