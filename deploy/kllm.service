@@ -1,0 +1,19 @@
+[Unit]
+Description=kLLM Seek-V inference server
+After=network.target
+
+[Service]
+Type=simple
+User=kllm
+Group=kllm
+EnvironmentFile=-/etc/kllm/env
+# KLLM_API_KEY is read by the binary from the environment.
+ExecStart=/usr/local/bin/kllm --checkpoint /var/lib/kllm/model.skv --host 0.0.0.0 --port 8080 --max-concurrent 32 --log-requests
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+KillSignal=SIGTERM
+TimeoutStopSec=35
+
+[Install]
+WantedBy=multi-user.target
