@@ -5,6 +5,7 @@
 //! on the device. Matmul uses local memory tiling for better occupancy. Attention uses
 //! online-softmax (FlashAttention-style) for numerical stability and less traffic.
 //! Supports persistent weight buffers via DeviceBuffer to avoid repeated PCIe uploads.
+//! Feature 6: fused SwiGLU, vectorized RMSNorm, residual add.
 //! If no platform is available the backend reports `is_device_accelerated() == false`
 //! and the caller should use [`crate::ParallelCpuBackend`].
 
@@ -64,14 +65,28 @@ __kernel void rms_norm(
 {
     int r = get_global_id(0);
     if (r >= rows) return;
+    __global const float* row = x + r * hidden;
     float ss = 0.0f;
-    for (int c = 0; c < hidden; ++c) {
-        float v = x[r*hidden+c];
+    int c = 0;
+    for (; c + 3 < hidden; c += 4) {
+        float v0 = row[c], v1 = row[c+1], v2 = row[c+2], v3 = row[c+3];
+        ss += v0*v0 + v1*v1 + v2*v2 + v3*v3;
+    }
+    for (; c < hidden; ++c) {
+        float v = row[c];
         ss += v*v;
     }
     float inv = 1.0f / sqrt(ss / (float)hidden + eps);
-    for (int c = 0; c < hidden; ++c)
-        out[r*hidden+c] = weight[c] * x[r*hidden+c] * inv;
+    __global float* o = out + r * hidden;
+    c = 0;
+    for (; c + 3 < hidden; c += 4) {
+        o[c]   = weight[c]   * row[c]   * inv;
+        o[c+1] = weight[c+1] * row[c+1] * inv;
+        o[c+2] = weight[c+2] * row[c+2] * inv;
+        o[c+3] = weight[c+3] * row[c+3] * inv;
+    }
+    for (; c < hidden; ++c)
+        o[c] = weight[c] * row[c] * inv;
 }
 
 __kernel void silu_inplace(__global float* x, const int n) {
@@ -79,6 +94,31 @@ __kernel void silu_inplace(__global float* x, const int n) {
     if (i >= n) return;
     float v = x[i];
     x[i] = v / (1.0f + exp(-v));
+}
+
+// SwiGLU: out = silu(gate) * up  (elementwise). One kernel instead of silu + mul.
+__kernel void swiglu_fused(
+    __global const float* gate,
+    __global const float* up,
+    __global float* out,
+    const int n)
+{
+    int i = get_global_id(0);
+    if (i >= n) return;
+    float g = gate[i];
+    float s = g / (1.0f + exp(-g));
+    out[i] = s * up[i];
+}
+
+// Residual: out = x + residual
+__kernel void add_inplace(
+    __global float* x,
+    __global const float* residual,
+    const int n)
+{
+    int i = get_global_id(0);
+    if (i >= n) return;
+    x[i] += residual[i];
 }
 
 __kernel void softmax_rows(
@@ -121,9 +161,8 @@ __kernel void attention_causal(
     __global const float* qv = q + (ti * num_heads + head) * head_dim;
     __global float* out = attn + (ti * num_heads + head) * head_dim;
 
-    // Online softmax state
-    float m_i = -INFINITY;   // running max
-    float l_i = 0.0f;        // running sum of exp
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
     for (int c = 0; c < head_dim; ++c) out[c] = 0.0f;
 
     for (int j = 0; j <= pos; ++j) {
@@ -138,7 +177,6 @@ __kernel void attention_causal(
         float exp_m = exp(m_i - m_new);
         float alpha = exp(s - m_new);
 
-        // rescale previous accumulator
         for (int c = 0; c < head_dim; ++c)
             out[c] = out[c] * exp_m + alpha * vj[c];
 
@@ -383,7 +421,6 @@ impl GpuDevice {
         Ok(out)
     }
 
-    /// Upload a weight matrix once and keep it on device for repeated matmuls.
     pub fn upload_weights(&self, data: &[f32]) -> KResult<DeviceBuffer> {
         let d = &self.inner;
         let mem = d.buffer_from(data, CL_MEM_READ_ONLY).map_err(|e| KernelError::Unsupported(e))?;
@@ -394,8 +431,6 @@ impl GpuDevice {
         })
     }
 
-    /// Matmul using a weight matrix already resident on the device.
-    /// Only the activation `x` is uploaded → much less PCIe traffic.
     pub fn matmul_nt_cached(
         &self,
         x: &[f32],
@@ -597,6 +632,73 @@ impl GpuDevice {
         d.release_kernel(kernel);
         d.release_mem(kq); d.release_mem(kk); d.release_mem(kv); d.release_mem(ko);
         Ok(out)
+    }
+
+    /// Fused SwiGLU: out = silu(gate) * up
+    pub fn swiglu_fused(&self, gate: &[f32], up: &[f32]) -> KResult<Vec<f32>> {
+        if gate.len() != up.len() {
+            return Err(KernelError::Shape("swiglu_fused: len mismatch".into()));
+        }
+        let n = gate.len();
+        let d = &self.inner;
+        let kg = d.buffer_from(gate, CL_MEM_READ_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        let ku = d.buffer_from(up, CL_MEM_READ_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        let ko = d.buffer_empty(n, CL_MEM_WRITE_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        let kernel = d.kernel("swiglu_fused").map_err(|e| KernelError::Unsupported(e))?;
+        let ni = n as i32;
+        unsafe {
+            (d.api.clSetKernelArg)(kernel, 0, std::mem::size_of::<cl_mem>(), &kg as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 1, std::mem::size_of::<cl_mem>(), &ku as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 2, std::mem::size_of::<cl_mem>(), &ko as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 3, 4, &ni as *const _ as *const c_void);
+            let global = [n.max(1)];
+            let err = (d.api.clEnqueueNDRangeKernel)(
+                d.queue, kernel, 1, std::ptr::null(), global.as_ptr(), std::ptr::null(), 0, std::ptr::null(), std::ptr::null_mut(),
+            );
+            if err != CL_SUCCESS {
+                d.release_kernel(kernel);
+                d.release_mem(kg); d.release_mem(ku); d.release_mem(ko);
+                return Err(KernelError::Unsupported(format!("enqueue swiglu: {err}")));
+            }
+            (d.api.clFinish)(d.queue);
+        }
+        let out = d.read(ko, n).map_err(|e| KernelError::Unsupported(e))?;
+        d.release_kernel(kernel);
+        d.release_mem(kg); d.release_mem(ku); d.release_mem(ko);
+        Ok(out)
+    }
+
+    /// In-place residual: x[i] += residual[i]
+    pub fn add_inplace(&self, x: &mut [f32], residual: &[f32]) -> KResult<()> {
+        if x.len() != residual.len() {
+            return Err(KernelError::Shape("add_inplace: len mismatch".into()));
+        }
+        let n = x.len();
+        let d = &self.inner;
+        let kx = d.buffer_from(x, CL_MEM_READ_WRITE).map_err(|e| KernelError::Unsupported(e))?;
+        let kr = d.buffer_from(residual, CL_MEM_READ_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        let kernel = d.kernel("add_inplace").map_err(|e| KernelError::Unsupported(e))?;
+        let ni = n as i32;
+        unsafe {
+            (d.api.clSetKernelArg)(kernel, 0, std::mem::size_of::<cl_mem>(), &kx as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 1, std::mem::size_of::<cl_mem>(), &kr as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 2, 4, &ni as *const _ as *const c_void);
+            let global = [n.max(1)];
+            let err = (d.api.clEnqueueNDRangeKernel)(
+                d.queue, kernel, 1, std::ptr::null(), global.as_ptr(), std::ptr::null(), 0, std::ptr::null(), std::ptr::null_mut(),
+            );
+            if err != CL_SUCCESS {
+                d.release_kernel(kernel);
+                d.release_mem(kx); d.release_mem(kr);
+                return Err(KernelError::Unsupported(format!("enqueue add: {err}")));
+            }
+            (d.api.clFinish)(d.queue);
+        }
+        let out = d.read(kx, n).map_err(|e| KernelError::Unsupported(e))?;
+        x.copy_from_slice(&out);
+        d.release_kernel(kernel);
+        d.release_mem(kx); d.release_mem(kr);
+        Ok(())
     }
 }
 
