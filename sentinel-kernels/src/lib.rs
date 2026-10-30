@@ -1,10 +1,6 @@
 //! # SeekKernels
 //!
 //! Unified kernel surface for Seek-V.
-//!
-//! * [`SeekKernels::auto`] — CUDA → OpenCL → parallel CPU
-//! * [`SeekKernels::layer_with_rope`] — one decoder block on the selected backend
-//! * [`SeekKernels::gemm`] — matmul for lm_head / projections
 
 pub mod backend;
 pub(crate) mod conformance;
@@ -23,7 +19,7 @@ pub(crate) mod tensor_parallel;
 
 pub use backend::Backend;
 pub use error::{KernelError, Result};
-pub use gpu::GpuBackend;
+pub use gpu::{shared_opencl, DeviceBuffer, GpuBackend};
 pub use pipeline::LayerKvCache;
 pub use quant::{QuantMatrix, QuantScheme};
 
@@ -110,16 +106,12 @@ impl SeekKernels {
     pub fn cpu() -> Self {
         Self { kind: Kind::Cpu(CpuBackend) }
     }
-
     pub fn parallel() -> Self {
         Self { kind: Kind::Parallel(ParallelCpuBackend) }
     }
-
     pub fn gpu() -> Self {
         Self { kind: Kind::Gpu(GpuBackend::new()) }
     }
-
-    /// CUDA → OpenCL → parallel CPU.
     pub fn auto() -> Self {
         let g = GpuBackend::new();
         if g.is_device_accelerated() {
@@ -128,13 +120,8 @@ impl SeekKernels {
             Self::parallel()
         }
     }
-
-    pub fn with_rope_theta(self, _theta: f32) -> Self {
-        self
-    }
-    pub fn with_rms_eps(self, _eps: f32) -> Self {
-        self
-    }
+    pub fn with_rope_theta(self, _t: f32) -> Self { self }
+    pub fn with_rms_eps(self, _e: f32) -> Self { self }
 
     pub fn name(&self) -> &'static str {
         match &self.kind {
@@ -155,7 +142,6 @@ impl SeekKernels {
         }
     }
 
-    /// One decoder layer on the active backend (GPU when available).
     pub fn layer(
         &self,
         x: &mut [f32],
@@ -183,12 +169,56 @@ impl SeekKernels {
         }
     }
 
-    /// `out[m,n] = x[m,k] @ W[n,k]^T`
     pub fn gemm(&self, x: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         match &self.kind {
             Kind::Cpu(b) => b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n),
             Kind::Parallel(b) => b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n),
             Kind::Gpu(b) => b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n),
+        }
+    }
+
+    /// Causal attention (OpenCL online-softmax when available).
+    pub fn attention_causal(
+        &self,
+        q: &[f32],
+        k_cache: &[f32],
+        v_cache: &[f32],
+        tokens: usize,
+        start_pos: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Vec<f32>> {
+        let q = q.to_vec();
+        let k = k_cache.to_vec();
+        let v = v_cache.to_vec();
+        match &self.kind {
+            Kind::Cpu(b) => b.attention_causal(&q, &k, &v, tokens, start_pos, num_heads, num_kv_heads, head_dim),
+            Kind::Parallel(b) => b.attention_causal(&q, &k, &v, tokens, start_pos, num_heads, num_kv_heads, head_dim),
+            Kind::Gpu(b) => b.attention_causal(&q, &k, &v, tokens, start_pos, num_heads, num_kv_heads, head_dim),
+        }
+    }
+
+    /// Fused SiLU(gate)*up (OpenCL kernel when available).
+    pub fn swiglu_fused(&self, gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
+        match &self.kind {
+            Kind::Gpu(b) => b.swiglu_fused(gate, up),
+            _ => {
+                let mut g = gate.to_vec();
+                crate::reference::silu_inplace(&mut g)?;
+                for (a, b) in g.iter_mut().zip(up.iter()) {
+                    *a *= *b;
+                }
+                Ok(g)
+            }
+        }
+    }
+
+    /// GPU backend handle for weight caching (None if not Gpu kind).
+    pub fn gpu_backend(&self) -> Option<GpuBackend> {
+        match &self.kind {
+            Kind::Gpu(b) => Some(*b),
+            _ => None,
         }
     }
 }
