@@ -1,15 +1,11 @@
 //! GPU backend: CUDA (preferred) or OpenCL when present, else parallel CPU.
-//!
-//! * CUDA: runtime-loaded `libcuda.so.1` + embedded PTX ([`crate::gpu_cuda`]).
-//! * OpenCL: runtime-loaded `libOpenCL.so.1` ([`crate::gpu_opencl`]).
-//! No CUDA/OpenCL SDK required at compile time.
 
 use std::sync::OnceLock;
 
 use crate::backend::{Backend, Element, RmsNormOutput};
 use crate::error::Result;
 use crate::gpu_cuda::{try_default_cuda, CudaDevice};
-use crate::gpu_opencl::{try_default_device, GpuDevice};
+use crate::gpu_opencl::{try_default_device, DeviceBuffer, GpuDevice};
 use crate::parallel_cpu::ParallelCpuBackend;
 
 static CUDA: OnceLock<Option<CudaDevice>> = OnceLock::new();
@@ -23,7 +19,14 @@ fn opencl() -> Option<&'static GpuDevice> {
     OPENCL.get_or_init(try_default_device).as_ref()
 }
 
-/// Device-backed backend. Prefer this for inference hot paths when a GPU is available.
+/// Shared OpenCL device (for persistent weight uploads / cached GEMM).
+pub fn shared_opencl() -> Option<&'static GpuDevice> {
+    opencl()
+}
+
+/// Re-export for callers that cache expert weights on device.
+pub use crate::gpu_opencl::DeviceBuffer;
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GpuBackend;
 
@@ -32,7 +35,6 @@ impl GpuBackend {
         Self
     }
 
-    /// `true` when CUDA or OpenCL was opened successfully.
     pub fn is_device_accelerated(&self) -> bool {
         cuda().is_some() || opencl().is_some()
     }
@@ -43,7 +45,6 @@ impl GpuBackend {
             .or_else(|| opencl().map(|d| d.device_name()))
     }
 
-    /// `"cuda"` | `"opencl"` | `None` if CPU fallback only.
     pub fn accel_kind(&self) -> Option<&'static str> {
         if cuda().is_some() {
             Some("cuda")
@@ -52,6 +53,43 @@ impl GpuBackend {
         } else {
             None
         }
+    }
+
+    /// Fused SiLU(gate) * up on device when OpenCL is present.
+    pub fn swiglu_fused(&self, gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
+        if let Some(dev) = opencl() {
+            return dev.swiglu_fused(gate, up);
+        }
+        // CPU fallback
+        let mut g = gate.to_vec();
+        ParallelCpuBackend.silu_inplace(&mut g)?;
+        for (a, b) in g.iter_mut().zip(up.iter()) {
+            *a *= *b;
+        }
+        Ok(g)
+    }
+
+    /// Upload weights once; returns device buffer when OpenCL is available.
+    pub fn upload_weights(&self, data: &[f32]) -> Result<Option<DeviceBuffer>> {
+        if let Some(dev) = opencl() {
+            return Ok(Some(dev.upload_weights(data)?));
+        }
+        Ok(None)
+    }
+
+    /// Matmul against a cached device weight buffer (OpenCL).
+    pub fn matmul_nt_cached(
+        &self,
+        x: &[f32],
+        w: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        let dev = opencl().ok_or_else(|| {
+            crate::error::KernelError::Unsupported("matmul_nt_cached requires OpenCL".into())
+        })?;
+        dev.matmul_nt_cached(x, w, m, k, n)
     }
 }
 
