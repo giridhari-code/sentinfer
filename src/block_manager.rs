@@ -136,15 +136,29 @@ impl Blocks {
     }
 }
 
+/// Snapshot of KV-block pool usage (for logging / metrics).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockPoolStats {
+    pub total_blocks: usize,
+    pub free_blocks: usize,
+    pub used_blocks: usize,
+    pub peak_used: usize,
+}
+
 #[derive(Debug)]
 pub struct BlockManager {
     num_blocks: usize,
     blocks: Blocks,
+    peak_used: usize,
 }
 
 impl BlockManager {
     pub fn new(num_blocks: usize) -> Result<Self> {
-        Ok(Self { num_blocks, blocks: Blocks::new(num_blocks)? })
+        Ok(Self {
+            num_blocks,
+            blocks: Blocks::new(num_blocks)?,
+            peak_used: 0,
+        })
     }
 
     pub fn num_blocks(&self) -> usize {
@@ -171,6 +185,7 @@ impl BlockManager {
         for _ in 0..n {
             table.push(self.blocks.allocate()?);
         }
+        self.touch_peak();
         Ok(table)
     }
 
@@ -198,11 +213,38 @@ impl BlockManager {
     }
 
     pub fn allocate_single(&mut self) -> Result<BlockId> {
-        self.blocks.allocate()
+        let id = self.blocks.allocate()?;
+        self.touch_peak();
+        Ok(id)
     }
 
     pub fn num_free_blocks(&self) -> usize {
         self.blocks.num_free_blocks()
+    }
+
+    pub fn num_used_blocks(&self) -> usize {
+        // usable blocks are num_blocks - 1 (id 0 reserved)
+        (self.num_blocks - 1).saturating_sub(self.blocks.num_free_blocks())
+    }
+
+    pub fn peak_used_blocks(&self) -> usize {
+        self.peak_used
+    }
+
+    pub fn stats(&self) -> BlockPoolStats {
+        BlockPoolStats {
+            total_blocks: self.num_blocks.saturating_sub(1),
+            free_blocks: self.num_free_blocks(),
+            used_blocks: self.num_used_blocks(),
+            peak_used: self.peak_used,
+        }
+    }
+
+    fn touch_peak(&mut self) {
+        let used = self.num_used_blocks();
+        if used > self.peak_used {
+            self.peak_used = used;
+        }
     }
 }
 
@@ -234,8 +276,10 @@ mod tests {
         let t = bm.allocate(5).unwrap();
         assert_eq!(t, vec![1, 2, 3, 4, 5]);
         assert_eq!(bm.num_free_blocks(), 3);
+        assert_eq!(bm.num_used_blocks(), 5);
         bm.free_blocks(&t).unwrap();
         assert_eq!(bm.num_free_blocks(), 8);
+        assert_eq!(bm.peak_used_blocks(), 5);
         bm.reset().unwrap();
     }
 
@@ -264,5 +308,17 @@ mod tests {
         let mut bm = BlockManager::new(3).unwrap();
         bm.allocate(2).unwrap();
         assert!(bm.allocate_single().is_err());
+    }
+
+    #[test]
+    fn stats_report_peak() {
+        let mut bm = BlockManager::new(10).unwrap();
+        let a = bm.allocate(3).unwrap();
+        let b = bm.allocate(2).unwrap();
+        assert_eq!(bm.stats().used_blocks, 5);
+        bm.free_blocks(&b).unwrap();
+        assert_eq!(bm.stats().peak_used, 5);
+        assert_eq!(bm.stats().used_blocks, 3);
+        bm.free_blocks(&a).unwrap();
     }
 }
