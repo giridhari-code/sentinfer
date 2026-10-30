@@ -3,8 +3,9 @@
 //!   quantize -i model.skv -o model.skq --scheme int8     # packed SKQ1
 //!   quantize -i model.skv -o model-q8.skv --scheme int8  # fp32 rewrite (compat)
 
-use sentinel_kernels::QuantScheme;
-use sentinel_model::{quantize_checkpoint, QuantizedSeekV, SeekV};
+use std::path::Path;
+
+use sentinel_model::{quantize_checkpoint, QuantScheme, QuantizedSeekV, SeekV};
 
 fn main() {
     let mut input = None;
@@ -39,7 +40,7 @@ fn main() {
     let input = input.expect("--input required");
     let output = output.expect("--output required");
     let packed_out = output.ends_with(".skq");
-    let model = SeekV::load(&input).unwrap_or_else(|e| {
+    let model = SeekV::load(Path::new(&input)).unwrap_or_else(|e| {
         eprintln!("load: {e}");
         std::process::exit(1);
     });
@@ -50,7 +51,7 @@ fn main() {
     let fp: usize = model.weights().named_tensors().iter().map(|(_, t)| t.len() * 4).sum();
     let packed = q.nbytes_packed();
     if packed_out {
-        q.save_packed(&output).unwrap_or_else(|e| {
+        q.save_packed(Path::new(&output)).unwrap_or_else(|e| {
             eprintln!("save skq: {e}");
             std::process::exit(1);
         });
@@ -59,7 +60,7 @@ fn main() {
             fp as f64 / packed.max(1) as f64
         );
     } else {
-        match quantize_checkpoint(&input, &output, scheme) {
+        match quantize_checkpoint(Path::new(&input), Path::new(&output), scheme) {
             Ok((fp, packed)) => eprintln!(
                 "ok scheme={scheme:?} fp32_bytes={fp} packed_est={packed} ratio={:.2}x → {output}",
                 fp as f64 / packed.max(1) as f64

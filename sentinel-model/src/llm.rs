@@ -15,7 +15,6 @@ use crate::engine::{Engine, FinishedRequest};
 use crate::request::{CompletionRequest, RequestOutput, SamplingParams};
 use crate::quantized::QuantizedSeekV;
 use crate::seekv::SeekV;
-use crate::model::Model;
 use sentinel_kernels::QuantScheme;
 use crate::stats::{EngineStats, StatsLogger, StepStats};
 use crate::tokenizer::{ByteTokenizer, PieceTokenizer, Tokenizer};

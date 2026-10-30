@@ -177,8 +177,8 @@ impl QuantizedSeekV {
         let h = self.cfg.num_heads;
         let hk = self.cfg.num_kv_heads;
         let hd = self.cfg.head_dim;
-        let inter = self.cfg.intermediate_size;
-        let vocab = self.cfg.vocab_size;
+        let _inter = self.cfg.intermediate_size;
+        let _vocab = self.cfg.vocab_size;
         let eps = self.cfg.rms_eps;
         let theta = self.cfg.rope_theta;
         let start = step.start_pos;
