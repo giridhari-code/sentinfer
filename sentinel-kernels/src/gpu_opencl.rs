@@ -4,6 +4,7 @@
 //! `rms_norm`, `silu`, `softmax_rows`, `rope`, `attention_causal`) run as OpenCL C kernels
 //! on the device. Matmul uses local memory tiling for better occupancy. Attention uses
 //! online-softmax (FlashAttention-style) for numerical stability and less traffic.
+//! Supports persistent weight buffers via DeviceBuffer to avoid repeated PCIe uploads.
 //! If no platform is available the backend reports `is_device_accelerated() == false`
 //! and the caller should use [`crate::ParallelCpuBackend`].
 
@@ -209,7 +210,6 @@ impl ClDevice {
 
             let mut chosen_dev: cl_device_id = std::ptr::null_mut();
             let mut chosen_plat: cl_platform_id = std::ptr::null_mut();
-            // Prefer GPU devices, else any device.
             for &want in &[CL_DEVICE_TYPE_GPU, CL_DEVICE_TYPE_ALL] {
                 for &p in &plats {
                     let mut nd: cl_uint = 0;
@@ -232,12 +232,7 @@ impl ClDevice {
 
             let mut err = CL_SUCCESS;
             let ctx = (api.clCreateContext)(
-                std::ptr::null(),
-                1,
-                &chosen_dev,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut err,
+                std::ptr::null(), 1, &chosen_dev, std::ptr::null_mut(), std::ptr::null_mut(), &mut err,
             );
             if err != CL_SUCCESS || ctx.is_null() {
                 return Err(format!("clCreateContext failed: {err}"));
@@ -262,12 +257,7 @@ impl ClDevice {
                 (api.clGetProgramBuildInfo)(program, chosen_dev, CL_PROGRAM_BUILD_LOG, 0, std::ptr::null_mut(), &mut log_size);
                 let mut log = vec![0u8; log_size.max(1)];
                 (api.clGetProgramBuildInfo)(
-                    program,
-                    chosen_dev,
-                    CL_PROGRAM_BUILD_LOG,
-                    log.len(),
-                    log.as_mut_ptr() as *mut c_void,
-                    std::ptr::null_mut(),
+                    program, chosen_dev, CL_PROGRAM_BUILD_LOG, log.len(), log.as_mut_ptr() as *mut c_void, std::ptr::null_mut(),
                 );
                 let msg = String::from_utf8_lossy(&log).to_string();
                 (api.clReleaseProgram)(program);
@@ -323,15 +313,7 @@ impl ClDevice {
         let mut out = vec![0.0f32; n];
         let err = unsafe {
             (self.api.clEnqueueReadBuffer)(
-                self.queue,
-                mem,
-                CL_TRUE,
-                0,
-                n * 4,
-                out.as_mut_ptr() as *mut c_void,
-                0,
-                std::ptr::null(),
-                std::ptr::null_mut(),
+                self.queue, mem, CL_TRUE, 0, n * 4, out.as_mut_ptr() as *mut c_void, 0, std::ptr::null(), std::ptr::null_mut(),
             )
         };
         if err != CL_SUCCESS {
@@ -379,7 +361,6 @@ impl GpuDevice {
             (d.api.clSetKernelArg)(kernel, 3, 4, &mi as *const _ as *const c_void);
             (d.api.clSetKernelArg)(kernel, 4, 4, &ki as *const _ as *const c_void);
             (d.api.clSetKernelArg)(kernel, 5, 4, &ni as *const _ as *const c_void);
-            // Pad global size to multiple of tile size (16) for local memory kernel
             const TS: usize = 16;
             let global = [
                 ((m + TS - 1) / TS * TS).max(TS),
@@ -399,6 +380,64 @@ impl GpuDevice {
         let out = d.read(ko, m * n).map_err(|e| KernelError::Unsupported(e))?;
         d.release_kernel(kernel);
         d.release_mem(kx); d.release_mem(kw); d.release_mem(ko);
+        Ok(out)
+    }
+
+    /// Upload a weight matrix once and keep it on device for repeated matmuls.
+    pub fn upload_weights(&self, data: &[f32]) -> KResult<DeviceBuffer> {
+        let d = &self.inner;
+        let mem = d.buffer_from(data, CL_MEM_READ_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        Ok(DeviceBuffer {
+            mem,
+            len: data.len(),
+            device: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Matmul using a weight matrix already resident on the device.
+    /// Only the activation `x` is uploaded → much less PCIe traffic.
+    pub fn matmul_nt_cached(
+        &self,
+        x: &[f32],
+        w: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> KResult<Vec<f32>> {
+        if x.len() != m * k || w.len != n * k {
+            return Err(KernelError::Shape(format!("matmul_nt_cached: bad lens")));
+        }
+        let d = &self.inner;
+        let kx = d.buffer_from(x, CL_MEM_READ_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        let ko = d.buffer_empty(m * n, CL_MEM_WRITE_ONLY).map_err(|e| KernelError::Unsupported(e))?;
+        let kernel = d.kernel("matmul_nt").map_err(|e| KernelError::Unsupported(e))?;
+        let (mi, ki, ni) = (m as i32, k as i32, n as i32);
+        unsafe {
+            (d.api.clSetKernelArg)(kernel, 0, std::mem::size_of::<cl_mem>(), &kx as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 1, std::mem::size_of::<cl_mem>(), &w.mem as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 2, std::mem::size_of::<cl_mem>(), &ko as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 3, 4, &mi as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 4, 4, &ki as *const _ as *const c_void);
+            (d.api.clSetKernelArg)(kernel, 5, 4, &ni as *const _ as *const c_void);
+            const TS: usize = 16;
+            let global = [
+                ((m + TS - 1) / TS * TS).max(TS),
+                ((n + TS - 1) / TS * TS).max(TS),
+            ];
+            let local = [TS, TS];
+            let err = (d.api.clEnqueueNDRangeKernel)(
+                d.queue, kernel, 2, std::ptr::null(), global.as_ptr(), local.as_ptr(), 0, std::ptr::null(), std::ptr::null_mut(),
+            );
+            if err != CL_SUCCESS {
+                d.release_kernel(kernel);
+                d.release_mem(kx); d.release_mem(ko);
+                return Err(KernelError::Unsupported(format!("enqueue matmul_cached: {err}")));
+            }
+            (d.api.clFinish)(d.queue);
+        }
+        let out = d.read(ko, m * n).map_err(|e| KernelError::Unsupported(e))?;
+        d.release_kernel(kernel);
+        d.release_mem(kx); d.release_mem(ko);
         Ok(out)
     }
 
@@ -488,13 +527,7 @@ impl GpuDevice {
     }
 
     pub fn rope_inplace(
-        &self,
-        x: &mut [f32],
-        tokens: usize,
-        heads: usize,
-        head_dim: usize,
-        start_pos: usize,
-        theta: f32,
+        &self, x: &mut [f32], tokens: usize, heads: usize, head_dim: usize, start_pos: usize, theta: f32,
     ) -> KResult<()> {
         let d = &self.inner;
         let kx = d.buffer_from(x, CL_MEM_READ_WRITE).map_err(|e| KernelError::Unsupported(e))?;
@@ -526,15 +559,8 @@ impl GpuDevice {
     }
 
     pub fn attention_causal(
-        &self,
-        q: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
-        tokens: usize,
-        start_pos: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
+        &self, q: &[f32], k_cache: &[f32], v_cache: &[f32],
+        tokens: usize, start_pos: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize,
     ) -> KResult<Vec<f32>> {
         let d = &self.inner;
         let out_len = tokens * num_heads * head_dim;
@@ -544,11 +570,7 @@ impl GpuDevice {
         let ko = d.buffer_empty(out_len, CL_MEM_WRITE_ONLY).map_err(|e| KernelError::Unsupported(e))?;
         let kernel = d.kernel("attention_causal").map_err(|e| KernelError::Unsupported(e))?;
         let (ti, sp, nh, nkv, hd) = (
-            tokens as i32,
-            start_pos as i32,
-            num_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
+            tokens as i32, start_pos as i32, num_heads as i32, num_kv_heads as i32, head_dim as i32,
         );
         unsafe {
             (d.api.clSetKernelArg)(kernel, 0, std::mem::size_of::<cl_mem>(), &kq as *const _ as *const c_void);
@@ -575,5 +597,42 @@ impl GpuDevice {
         d.release_kernel(kernel);
         d.release_mem(kq); d.release_mem(kk); d.release_mem(kv); d.release_mem(ko);
         Ok(out)
+    }
+}
+
+/// A weight (or other) buffer that lives on the OpenCL device.
+/// Dropping it releases the device memory.
+pub struct DeviceBuffer {
+    mem: cl_mem,
+    len: usize,
+    device: Arc<ClDevice>,
+}
+
+impl DeviceBuffer {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        self.device.release_mem(self.mem);
+    }
+}
+
+unsafe impl Send for DeviceBuffer {}
+unsafe impl Sync for DeviceBuffer {}
+
+/// Open the default OpenCL device (GPU preferred). Returns None if unavailable.
+pub fn try_default_device() -> Option<GpuDevice> {
+    match GpuDevice::try_new() {
+        Ok(d) => Some(d),
+        Err(e) => {
+            eprintln!("[sentinel-kernels] OpenCL unavailable: {e}");
+            None
+        }
     }
 }
