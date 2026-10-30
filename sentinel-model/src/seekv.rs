@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use sentinel_core::DecoderFlopsConfig;
 use sentinel_core::{Result, SeqId, SentinelError};
+use sentinel_kernels::{LayerKvCache, LayerWeights as KernLayerWeights, ModelDims, SeekKernels};
 use sentinel_kernels::reference as kern;
 
 use crate::model::{Model, StepInput};
@@ -268,13 +269,18 @@ pub struct SeekV {
     cfg: SeekVConfig,
     w: SeekVWeights,
     caches: HashMap<SeqId, KvCache>,
+    /// Unified kernel engine (parallel CPU by default).
+    kernels: SeekKernels,
 }
 
 impl SeekV {
     pub fn new(cfg: SeekVConfig, weights: SeekVWeights) -> Result<Self> {
         cfg.validate()?;
         weights.validate(&cfg)?;
-        Ok(Self { cfg, w: weights, caches: HashMap::new() })
+        let kernels = SeekKernels::parallel()
+            .with_rope_theta(cfg.rope_theta)
+            .with_rms_eps(cfg.rms_eps);
+        Ok(Self { cfg, w: weights, caches: HashMap::new(), kernels })
     }
 
     pub fn random(cfg: SeekVConfig, seed: u64) -> Result<Self> {
@@ -361,7 +367,7 @@ impl SeekV {
             self.cfg.intermediate_size,
             self.cfg.vocab_size,
         );
-        let (eps, theta, start) = (self.cfg.rms_eps, self.cfg.rope_theta, step.start_pos);
+        let (eps, start) = (self.cfg.rms_eps, step.start_pos);
         let kv_stride = hk * hd;
         let w = &self.w;
 
@@ -371,42 +377,44 @@ impl SeekV {
             x[i * d..(i + 1) * d].copy_from_slice(&w.embed[tok * d..(tok + 1) * d]);
         }
 
-        // Heavy ops use `sentinel-kernels::reference` — the same kernels `CpuBackend`
-        // implements. A future GPU `Backend` will swap in here without changing the graph.
-        let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        // Decoder blocks go through SeekKernels (single kernel surface).
+        let dims = ModelDims {
+            tokens: t,
+            start_pos: start,
+            hidden: d,
+            num_heads: h,
+            num_kv_heads: hk,
+            head_dim: hd,
+            intermediate: inter,
+            vocab,
+            rms_eps: eps,
+        };
         for (l, lw) in w.layers.iter().enumerate() {
-            // attention block
-            let (hn, _) = kern::rms_norm(&x, &lw.attn_norm, None, t, d, eps).map_err(kerr)?;
-            let mut q = kern::matmul_nt_parallel(&hn, &lw.wq, t, d, h * hd, threads).map_err(kerr)?;
-            let mut k = kern::matmul_nt_parallel(&hn, &lw.wk, t, d, kv_stride, threads).map_err(kerr)?;
-            let v = kern::matmul_nt_parallel(&hn, &lw.wv, t, d, kv_stride, threads).map_err(kerr)?;
-            kern::rope_inplace(&mut q, t, h, hd, start, theta).map_err(kerr)?;
-            kern::rope_inplace(&mut k, t, hk, hd, start, theta).map_err(kerr)?;
-            cache.k[l].extend_from_slice(&k);
-            cache.v[l].extend_from_slice(&v);
-
-            // Fused causal attention (kernel layer — CPU today, GPU path ready on Backend).
-            let attn = kern::attention_causal(&q, &cache.k[l], &cache.v[l], t, start, h, hk, hd).map_err(kerr)?;
-            let o = kern::matmul_nt_parallel(&attn, &lw.wo, t, h * hd, d, threads).map_err(kerr)?;
-            for (xi, oi) in x.iter_mut().zip(&o) {
-                *xi += oi;
-            }
-
-            // MLP block (SwiGLU)
-            let (mn, _) = kern::rms_norm(&x, &lw.mlp_norm, None, t, d, eps).map_err(kerr)?;
-            let mut gate = kern::matmul_nt_parallel(&mn, &lw.w_gate, t, d, inter, threads).map_err(kerr)?;
-            let up = kern::matmul_nt_parallel(&mn, &lw.w_up, t, d, inter, threads).map_err(kerr)?;
-            kern::silu_inplace(&mut gate);
-            let act: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| g * u).collect();
-            let down = kern::matmul_nt_parallel(&act, &lw.w_down, t, inter, d, threads).map_err(kerr)?;
-            for (xi, di) in x.iter_mut().zip(&down) {
-                *xi += di;
-            }
+            let mut layer_cache = LayerKvCache {
+                k: std::mem::take(&mut cache.k[l]),
+                v: std::mem::take(&mut cache.v[l]),
+                len: start,
+            };
+            let kw = KernLayerWeights {
+                attn_norm: &lw.attn_norm,
+                wq: &lw.wq,
+                wk: &lw.wk,
+                wv: &lw.wv,
+                wo: &lw.wo,
+                mlp_norm: &lw.mlp_norm,
+                w_gate: &lw.w_gate,
+                w_up: &lw.w_up,
+                w_down: &lw.w_down,
+            };
+            self.kernels.layer(&mut x, dims, &kw, &mut layer_cache).map_err(kerr)?;
+            let end = layer_cache.len * kv_stride;
+            cache.k[l] = layer_cache.k[..end.min(layer_cache.k.len())].to_vec();
+            cache.v[l] = layer_cache.v[..end.min(layer_cache.v.len())].to_vec();
         }
 
-        // Only the last token's logits are needed.
+        // Final norm + lm_head via the same kernel math (reference rms + SeekKernels gemm).
         let (last, _) = kern::rms_norm(&x[(t - 1) * d..t * d], &w.final_norm, None, 1, d, eps).map_err(kerr)?;
-        let logits = kern::matmul_nt_parallel(&last, &w.lm_head, 1, d, vocab, threads).map_err(kerr)?;
+        let logits = self.kernels.gemm(&last, &w.lm_head, 1, d, vocab).map_err(kerr)?;
 
         cache.len = start + t;
         self.caches.insert(step.seq_id, cache);

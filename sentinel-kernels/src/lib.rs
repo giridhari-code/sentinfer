@@ -72,6 +72,7 @@ pub struct ModelDims {
     pub head_dim: usize,
     pub intermediate: usize,
     pub vocab: usize,
+    pub rms_eps: f32,
 }
 
 impl From<ModelDims> for PipelineDims {
@@ -85,6 +86,7 @@ impl From<ModelDims> for PipelineDims {
             head_dim: d.head_dim,
             intermediate: d.intermediate,
             vocab: d.vocab,
+            rms_eps: d.rms_eps,
         }
     }
 }
@@ -99,23 +101,29 @@ enum Kind {
 pub struct SeekKernels {
     kind: Kind,
     rope_theta: f32,
+    rms_eps: f32,
 }
 
 impl SeekKernels {
     pub fn cpu() -> Self {
-        Self { kind: Kind::Cpu(CpuBackend), rope_theta: 10_000.0 }
+        Self { kind: Kind::Cpu(CpuBackend), rope_theta: 10_000.0, rms_eps: 1e-6 }
     }
 
     pub fn parallel() -> Self {
-        Self { kind: Kind::Parallel(ParallelCpuBackend), rope_theta: 10_000.0 }
+        Self { kind: Kind::Parallel(ParallelCpuBackend), rope_theta: 10_000.0, rms_eps: 1e-6 }
     }
 
     pub fn gpu() -> Self {
-        Self { kind: Kind::Gpu(Gpu::new()), rope_theta: 10_000.0 }
+        Self { kind: Kind::Gpu(Gpu::new()), rope_theta: 10_000.0, rms_eps: 1e-6 }
     }
 
     pub fn with_rope_theta(mut self, theta: f32) -> Self {
         self.rope_theta = theta;
+        self
+    }
+
+    pub fn with_rms_eps(mut self, eps: f32) -> Self {
+        self.rms_eps = eps;
         self
     }
 
@@ -200,6 +208,7 @@ mod tests {
             head_dim: 4,
             intermediate: 16,
             vocab: 12,
+            rms_eps: 1e-6,
         };
         let d = dims.hidden;
         let inter = dims.intermediate;

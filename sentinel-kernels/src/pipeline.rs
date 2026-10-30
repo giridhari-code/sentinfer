@@ -29,6 +29,7 @@ pub struct PipelineDims {
     pub head_dim: usize,
     pub intermediate: usize,
     pub vocab: usize,
+    pub rms_eps: f32,
 }
 
 impl PipelineDims {
@@ -170,7 +171,7 @@ pub fn run_layer(
 
     let residual = x.to_vec();
     // attn norm
-    let (mut h_in, _) = reference::rms_norm(x, w.attn_norm, None, t, d, 1e-5)?;
+    let (mut h_in, _) = reference::rms_norm(x, w.attn_norm, None, t, d, dims.rms_eps)?;
     // QKV
     let mut q = reference::matmul_nt(&h_in, w.wq, t, d, h * hd)?;
     let mut k = reference::matmul_nt(&h_in, w.wk, t, d, hk * hd)?;
@@ -205,7 +206,7 @@ pub fn run_layer(
 
     // MLP
     let residual2 = attn_out.clone();
-    let (h2, _) = reference::rms_norm(&attn_out, w.mlp_norm, None, t, d, 1e-5)?;
+    let (h2, _) = reference::rms_norm(&attn_out, w.mlp_norm, None, t, d, dims.rms_eps)?;
     let mut gate = reference::matmul_nt(&h2, w.w_gate, t, d, inter)?;
     let up = reference::matmul_nt(&h2, w.w_up, t, d, inter)?;
     reference::silu_inplace(&mut gate);
@@ -236,7 +237,7 @@ pub fn run_forward(
     }
     let t = dims.tokens;
     let d = dims.hidden;
-    let (normed, _) = reference::rms_norm(&x, final_norm, None, t, d, 1e-5)?;
+    let (normed, _) = reference::rms_norm(&x, final_norm, None, t, d, dims.rms_eps)?;
     // last token logits only (decode-friendly)
     let last = &normed[(t - 1) * d..t * d];
     let logits = reference::matmul_nt(last, lm_head, 1, d, dims.vocab)?;
@@ -334,7 +335,7 @@ pub fn run_layer_backend<B: Backend>(
         None,
         t,
         d,
-        1e-5,
+        dims.rms_eps,
     )?.out;
     let h2 = backend.download(&h2)?;
     let mut gate = backend.download(&backend.matmul_nt(
@@ -416,6 +417,7 @@ mod tests {
             head_dim: 4,
             intermediate: 32,
             vocab: 20,
+            rms_eps: 1e-6,
         };
         let (an, wq, wk, wv, wo, mn, wg, wu, wd) = unit_layer(16, 4, 2, 4, 32);
         let view = LayerWeightsView {
@@ -465,6 +467,7 @@ mod tests {
             head_dim: 4,
             intermediate: 16,
             vocab: 10,
+            rms_eps: 1e-6,
         };
         let (an, wq, wk, wv, wo, mn, wg, wu, wd) = unit_layer(8, 2, 2, 4, 16);
         let view = LayerWeightsView {

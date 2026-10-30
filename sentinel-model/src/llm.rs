@@ -13,7 +13,10 @@ use sentinel_core::{Result, SeqId, SentinelError};
 use crate::config::EngineArgs;
 use crate::engine::{Engine, FinishedRequest};
 use crate::request::{CompletionRequest, RequestOutput, SamplingParams};
+use crate::quantized::QuantizedSeekV;
 use crate::seekv::SeekV;
+use crate::model::Model;
+use sentinel_kernels::QuantScheme;
 use crate::stats::{EngineStats, StatsLogger, StepStats};
 use crate::tokenizer::{ByteTokenizer, PieceTokenizer, Tokenizer};
 
@@ -31,8 +34,64 @@ pub struct StreamDelta {
 }
 
 /// Full inference service: tokenize → continuous batch → detokenize.
+enum EngineKind {
+    Fp32(Engine<SeekV>),
+    Quant(Engine<QuantizedSeekV>),
+}
+
+
+impl EngineKind {
+    fn add_request(
+        &mut self,
+        request_id: &str,
+        prompt: Vec<i32>,
+        params: crate::engine::GenerationParams,
+    ) -> Result<SeqId> {
+        match self {
+            Self::Fp32(e) => e.add_request(request_id, prompt, params),
+            Self::Quant(e) => e.add_request(request_id, prompt, params),
+        }
+    }
+
+    fn abort(&mut self, request_id: &str) {
+        match self {
+            Self::Fp32(e) => e.abort(request_id),
+            Self::Quant(e) => e.abort(request_id),
+        }
+    }
+
+    fn step(&mut self) -> Result<Vec<crate::engine::FinishedRequest>> {
+        match self {
+            Self::Fp32(e) => e.step(),
+            Self::Quant(e) => e.step(),
+        }
+    }
+
+    fn has_unfinished_seqs(&self) -> bool {
+        match self {
+            Self::Fp32(e) => e.scheduler().has_unfinished_seqs(),
+            Self::Quant(e) => e.scheduler().has_unfinished_seqs(),
+        }
+    }
+
+    fn num_unfinished_seqs(&self) -> usize {
+        match self {
+            Self::Fp32(e) => e.scheduler().num_unfinished_seqs(),
+            Self::Quant(e) => e.scheduler().num_unfinished_seqs(),
+        }
+    }
+
+    fn sequence(&self, seq_id: SeqId) -> Option<&sentinel_core::Sequence> {
+        match self {
+            Self::Fp32(e) => e.scheduler().sequence(seq_id),
+            Self::Quant(e) => e.scheduler().sequence(seq_id),
+        }
+    }
+}
+
+/// Full inference service: tokenize → continuous batch → detokenize.
 pub struct Llm {
-    engine: Engine<SeekV>,
+    engine: EngineKind,
     tokenizer: Box<dyn Tokenizer>,
     /// prompt tokens retained until the request finishes (for RequestOutput).
     prompts: HashMap<SeqId, Vec<i32>>,
@@ -57,7 +116,7 @@ impl Llm {
         }
         let sched = args.scheduler_config(cfg_model.max_positions, cfg_model.eos_token_id, cfg_model.vocab_size as i32);
         let blocks = args.num_blocks(cfg_model.max_positions);
-        let engine = Engine::for_seekv(sched, blocks, model)?;
+        let engine = EngineKind::Fp32(Engine::for_seekv(sched, blocks, model)?);
         Ok(Self {
             engine,
             tokenizer,
@@ -66,6 +125,58 @@ impl Llm {
             stats: StatsLogger::new(args.log_stats),
             next_req: 1,
         })
+    }
+
+    /// Runtime int8/int4 model ([`QuantizedSeekV`]).
+    pub fn from_quantized(model: QuantizedSeekV, args: EngineArgs) -> Result<Self> {
+        Self::from_quantized_with_tokenizer(model, args, Box::new(ByteTokenizer))
+    }
+
+    pub fn from_quantized_with_tokenizer(
+        model: QuantizedSeekV,
+        args: EngineArgs,
+        tokenizer: Box<dyn Tokenizer>,
+    ) -> Result<Self> {
+        let cfg = model.config().clone();
+        if tokenizer.vocab_size() != cfg.vocab_size {
+            return Err(SentinelError::InvalidState(format!(
+                "tokenizer vocab {} != model vocab {}",
+                tokenizer.vocab_size(),
+                cfg.vocab_size
+            )));
+        }
+        let sched = args.scheduler_config(cfg.max_positions, cfg.eos_token_id, cfg.vocab_size as i32);
+        let blocks = args.num_blocks(cfg.max_positions);
+        let engine = EngineKind::Quant(Engine::for_quantized_seekv(sched, blocks, model)?);
+        Ok(Self {
+            engine,
+            tokenizer,
+            prompts: HashMap::new(),
+            prompt_texts: HashMap::new(),
+            stats: StatsLogger::new(args.log_stats),
+            next_req: 1,
+        })
+    }
+
+    /// Load `.skv` then quantize in memory, or load `.skq` packed.
+    pub fn from_checkpoint_quant(
+        path: impl AsRef<Path>,
+        scheme: QuantScheme,
+        vocab: Option<&Path>,
+        args: EngineArgs,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let q = if path.extension().and_then(|e| e.to_str()) == Some("skq") {
+            QuantizedSeekV::load_packed(path)?
+        } else {
+            let m = SeekV::load(path)?;
+            QuantizedSeekV::from_fp32(&m, scheme)?
+        };
+        let tok: Box<dyn Tokenizer> = match vocab {
+            Some(v) => Box::new(PieceTokenizer::from_vocab_file(v)?),
+            None => Box::new(ByteTokenizer),
+        };
+        Self::from_quantized_with_tokenizer(q, args, tok)
     }
 
     pub fn from_checkpoint(path: impl AsRef<Path>, args: EngineArgs) -> Result<Self> {
@@ -91,12 +202,8 @@ impl Llm {
         Self::new(SeekV::random(cfg, seed)?, args)
     }
 
-    pub fn engine(&self) -> &Engine<SeekV> {
-        &self.engine
-    }
-
-    pub fn engine_mut(&mut self) -> &mut Engine<SeekV> {
-        &mut self.engine
+    pub fn is_quantized(&self) -> bool {
+        matches!(self.engine, EngineKind::Quant(_))
     }
 
     pub fn tokenizer(&self) -> &dyn Tokenizer {
@@ -133,11 +240,11 @@ impl Llm {
     }
 
     pub fn has_unfinished(&self) -> bool {
-        self.engine.scheduler().has_unfinished_seqs()
+        self.engine.has_unfinished_seqs()
     }
 
     pub fn num_unfinished(&self) -> usize {
-        self.engine.scheduler().num_unfinished_seqs()
+        self.engine.num_unfinished_seqs()
     }
 
     /// One scheduling + model step; returns newly finished outputs.
@@ -227,7 +334,7 @@ impl Llm {
 
     /// Completion tokens generated so far for a live sequence.
     pub fn completion_token_ids(&self, seq_id: SeqId) -> Vec<i32> {
-        let Some(seq) = self.engine.scheduler().sequence(seq_id) else {
+        let Some(seq) = self.engine.sequence(seq_id) else {
             return Vec::new();
         };
         let prompt_len = self

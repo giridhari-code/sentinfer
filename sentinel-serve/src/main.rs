@@ -32,6 +32,7 @@ usage: kllm --checkpoint FILE.skv [options]
   --log-requests           log method path status ms
   --log-stats              engine step stats
   --vocab FILE             PieceTokenizer vocab (match model vocab_size)
+  --quant int8|int4         load .skv as quantized runtime (or load .skq)
 ";
 
 struct App {
@@ -57,6 +58,7 @@ fn now_ts() -> u64 {
 struct Cli {
     checkpoint: PathBuf,
     vocab: Option<PathBuf>,
+    quant: Option<String>,
     host: String,
     port: u16,
     api_key: Option<String>,
@@ -68,6 +70,7 @@ struct Cli {
 fn parse_args() -> Result<Cli, String> {
     let mut checkpoint = None;
     let mut vocab = None;
+    let mut quant = None;
     let mut host = "0.0.0.0".to_string();
     let mut port = 8080u16;
     let mut api_key = None;
@@ -79,6 +82,7 @@ fn parse_args() -> Result<Cli, String> {
         match a.as_str() {
             "--checkpoint" => checkpoint = Some(it.next().ok_or("--checkpoint needs a value")?.into()),
             "--vocab" => vocab = Some(it.next().ok_or("--vocab needs a value")?.into()),
+            "--quant" => quant = Some(it.next().ok_or("--quant needs int8|int4")?),
             "--host" => host = it.next().ok_or("--host needs a value")?,
             "--port" => port = it.next().ok_or("--port needs a value")?.parse().map_err(|_| "bad --port")?,
             "--api-key" => api_key = Some(it.next().ok_or("--api-key needs a value")?),
@@ -109,6 +113,7 @@ fn parse_args() -> Result<Cli, String> {
     Ok(Cli {
         checkpoint: checkpoint.ok_or_else(|| format!("--checkpoint required\n\n{USAGE}"))?,
         vocab,
+        quant,
         host,
         port,
         api_key,
@@ -703,10 +708,29 @@ fn main() {
     };
     let mut args = EngineArgs::default();
     args.log_stats = cli.log_stats;
-    let llm = Llm::from_checkpoint_with_vocab(&cli.checkpoint, cli.vocab.as_deref(), args).unwrap_or_else(|e| {
-        eprintln!("kLLM: failed to load checkpoint: {e}");
-        std::process::exit(1);
-    });
+    let llm = {
+        let path = &cli.checkpoint;
+        let is_skq = path.extension().and_then(|e| e.to_str()) == Some("skq");
+        let result = if let Some(ref q) = cli.quant {
+            let scheme = match q.as_str() {
+                "int8" | "q8" => sentinel_kernels::QuantScheme::Int8,
+                "int4" | "q4" => sentinel_kernels::QuantScheme::Int4,
+                other => {
+                    eprintln!("kLLM: unknown --quant {other} (use int8|int4)");
+                    std::process::exit(2);
+                }
+            };
+            Llm::from_checkpoint_quant(path, scheme, cli.vocab.as_deref(), args)
+        } else if is_skq {
+            Llm::from_checkpoint_quant(path, sentinel_kernels::QuantScheme::Int8, cli.vocab.as_deref(), args)
+        } else {
+            Llm::from_checkpoint_with_vocab(path, cli.vocab.as_deref(), args)
+        };
+        result.unwrap_or_else(|e| {
+            eprintln!("kLLM: failed to load checkpoint: {e}");
+            std::process::exit(1);
+        })
+    };
     let model_id = cli.checkpoint.file_stem().and_then(|s| s.to_str()).unwrap_or("seekv").to_string();
     let app = Arc::new(App {
         llm: Mutex::new(llm),

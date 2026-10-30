@@ -206,6 +206,20 @@ impl Engine<crate::seekv::SeekV> {
     }
 }
 
+impl Engine<crate::quantized::QuantizedSeekV> {
+    /// Engine over int8/int4 runtime weights ([`QuantizedSeekV`]).
+    pub fn for_quantized_seekv(
+        cfg: SchedulerConfig,
+        num_blocks: usize,
+        model: crate::quantized::QuantizedSeekV,
+    ) -> Result<Self> {
+        let flops = FlopsEstimator::new(model.config().flops_config());
+        let mut engine = Self::new(cfg, num_blocks, model)?;
+        engine.set_flops_estimator(flops);
+        Ok(engine)
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
