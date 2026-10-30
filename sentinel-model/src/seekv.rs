@@ -1,4 +1,7 @@
 //! Seek-V: decoder-only transformer. Dense/MoE; GPU via SeekKernels::auto.
+//!
+//! MoE path: persistent OpenCL expert weights (`MoEGpuCache`), fused SwiGLU,
+//! GPU attention (online-softmax).
 
 use std::collections::HashMap;
 
@@ -235,6 +238,7 @@ pub struct SeekV {
     w: SeekVWeights,
     caches: HashMap<SeqId, KvCache>,
     kernels: SeekKernels,
+    moe_gpu: Vec<Option<crate::moe::MoEGpuCache>>,
 }
 
 impl SeekV {
@@ -244,13 +248,27 @@ impl SeekV {
         let kernels = SeekKernels::auto()
             .with_rope_theta(cfg.rope_theta)
             .with_rms_eps(cfg.rms_eps);
-        Ok(Self { cfg, w: weights, caches: HashMap::new(), kernels })
+        let moe_gpu = match &weights.moe {
+            Some(layers) => layers
+                .iter()
+                .map(|m| crate::moe::MoEGpuCache::try_upload(m).ok().flatten())
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok(Self { cfg, w: weights, caches: HashMap::new(), kernels, moe_gpu })
     }
 
     pub fn with_kernels(cfg: SeekVConfig, weights: SeekVWeights, kernels: SeekKernels) -> Result<Self> {
         cfg.validate()?;
         weights.validate(&cfg)?;
-        Ok(Self { cfg, w: weights, caches: HashMap::new(), kernels })
+        let moe_gpu = match &weights.moe {
+            Some(layers) => layers
+                .iter()
+                .map(|m| crate::moe::MoEGpuCache::try_upload(m).ok().flatten())
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok(Self { cfg, w: weights, caches: HashMap::new(), kernels, moe_gpu })
     }
 
     pub fn random(cfg: SeekVConfig, seed: u64) -> Result<Self> {
@@ -273,6 +291,9 @@ impl SeekV {
     }
     pub fn kernel_backend(&self) -> &'static str { self.kernels.name() }
     pub fn is_gpu_accelerated(&self) -> bool { self.kernels.is_accelerated() }
+    pub fn has_moe_gpu_cache(&self) -> bool {
+        self.moe_gpu.iter().any(|c| c.is_some())
+    }
 
     fn forward_one(&mut self, step: &StepInput<'_>) -> Result<Vec<f32>> {
         let t = step.tokens.len();
@@ -326,10 +347,12 @@ impl SeekV {
                 };
                 if !write_kv { layer_cache.len = start + t; }
                 if use_moe {
+                    let moe_cache = self.moe_gpu.get(l).and_then(|c| c.as_ref());
                     Self::layer_attn_then_moe(
                         &mut x, lw, w.moe.as_ref().unwrap().get(l).expect("moe"),
                         &mut layer_cache, t, start, d, h, hk, hd, eps, self.cfg.rope_theta, write_kv,
                         &self.kernels,
+                        moe_cache,
                     )?;
                 } else if write_kv {
                     let kw = KernLayerWeights {
@@ -363,6 +386,7 @@ impl SeekV {
         t: usize, start: usize, d: usize, h: usize, hk: usize, hd: usize, eps: f32, rope_theta: f32,
         write_kv: bool,
         kernels: &SeekKernels,
+        moe_cache: Option<&crate::moe::MoEGpuCache>,
     ) -> Result<()> {
         let residual = x.to_vec();
         let (h_in, _) = kern::rms_norm(x, &lw.attn_norm, None, t, d, eps).map_err(kerr)?;
@@ -386,15 +410,23 @@ impl SeekV {
             cache.len = total;
         }
         let kv_len = cache.len.max(total);
-        let attn = kern::attention_causal(
-            &q, &cache.k[..kv_len * stride], &cache.v[..kv_len * stride], t, start, h, hk, hd,
-        ).map_err(kerr)?;
+        let attn = kernels
+            .attention_causal(
+                &q,
+                &cache.k[..kv_len * stride],
+                &cache.v[..kv_len * stride],
+                t,
+                start,
+                h,
+                hk,
+                hd,
+            )
+            .map_err(kerr)?;
         let mut attn_out = kernels.gemm(&attn, &lw.wo, t, h * hd, d).map_err(kerr)?;
         for (a, b) in attn_out.iter_mut().zip(residual.iter()) { *a += *b; }
         let residual2 = attn_out.clone();
         let (h2, _) = kern::rms_norm(&attn_out, &lw.mlp_norm, None, t, d, eps).map_err(kerr)?;
-        // GPU expert GEMMs when kernels is CUDA/OpenCL
-        let mut mlp = crate::moe::moe_ffn_kernels(&h2, moe, kernels)?;
+        let mut mlp = crate::moe::moe_ffn_cached(&h2, moe, moe_cache, kernels)?;
         for (a, b) in mlp.iter_mut().zip(residual2.iter()) { *a += *b; }
         x.copy_from_slice(&mlp);
         Ok(())
@@ -412,9 +444,18 @@ impl SeekV {
         kern::rope_inplace(&mut q, t, h, hd, start, rope_theta).map_err(kerr)?;
         let stride = hk * hd;
         let kv_len = cache.len;
-        let attn = kern::attention_causal(
-            &q, &cache.k[..kv_len * stride], &cache.v[..kv_len * stride], t, start, h, hk, hd,
-        ).map_err(kerr)?;
+        let attn = kernels
+            .attention_causal(
+                &q,
+                &cache.k[..kv_len * stride],
+                &cache.v[..kv_len * stride],
+                t,
+                start,
+                h,
+                hk,
+                hd,
+            )
+            .map_err(kerr)?;
         let mut attn_out = kernels.gemm(&attn, &lw.wo, t, h * hd, d).map_err(kerr)?;
         for (a, b) in attn_out.iter_mut().zip(residual.iter()) { *a += *b; }
         let residual2 = attn_out.clone();
@@ -463,8 +504,17 @@ mod tests {
     #[test]
     fn moe_gpu_path_runs() {
         let mut m = SeekV::random(SeekVConfig::tiny_moe(), 3).unwrap();
+        let _ = m.kernel_backend();
+        let _ = m.has_moe_gpu_cache();
         let logits = m.forward(&[step(1, &[1, 2, 3], 0)]).unwrap();
         assert_eq!(logits.len(), 258);
+        assert!(logits.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn dense_gpu_path_runs() {
+        let mut m = SeekV::random(SeekVConfig::tiny(), 1).unwrap();
+        let logits = m.forward(&[step(1, &[1, 2], 0)]).unwrap();
         assert!(logits.iter().all(|x| x.is_finite()));
     }
 }
