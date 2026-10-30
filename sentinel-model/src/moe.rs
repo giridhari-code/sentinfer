@@ -2,7 +2,8 @@
 //!
 //! * Router: linear hidden → num_experts, softmax, top-k
 //! * Experts: SwiGLU FFNs
-//! * DeepGEMM-style: pack tokens per expert for batched matmul_nt
+//! * DeepGEMM-style: pack tokens per expert for batched matmul
+//! * GPU: [`moe_ffn_kernels`] / [`dense_swiglu_kernels`] via `SeekKernels::gemm`
 //! * EP/EPLB: scaffolding only (`ExpertParallelConfig`)
 
 use std::cmp::Ordering;
@@ -152,13 +153,14 @@ fn softmax_rows(logits: &mut [f32], rows: usize, cols: usize) {
 
 fn top_k_row(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut idx: Vec<usize> = (0..scores.len()).collect();
-    idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(Ordering::equal));
+    idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(Ordering::Equal));
     idx.truncate(k);
     let sum: f32 = idx.iter().map(|&i| scores[i]).sum();
     let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
     idx.into_iter().map(|i| (i, scores[i] * inv)).collect()
 }
 
+/// CPU-reference MoE FFN.
 pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
     moe.validate()?;
     let cfg = &moe.cfg;
@@ -220,6 +222,7 @@ pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Dense SwiGLU (CPU reference).
 pub fn dense_swiglu(
     x: &[f32],
     w_gate: &[f32],
@@ -238,6 +241,95 @@ pub fn dense_swiglu(
     kern::matmul_nt(&gate, w_down, tokens, intermediate, hidden).map_err(kerr)
 }
 
+/// MoE FFN using `SeekKernels::gemm` (GPU when CUDA/OpenCL available).
+///
+//! Algorithm matches [`moe_ffn`]: router → top-k → pack per expert → SwiGLU → weighted scatter.
+/// Large GEMMs go through the kernel backend; softmax / top-k / SiLU stay on host.
+pub fn moe_ffn_kernels(
+    x: &[f32],
+    moe: &MoEWeights,
+    kernels: &sentinel_kernels::SeekKernels,
+) -> Result<Vec<f32>> {
+    moe.validate()?;
+    let cfg = &moe.cfg;
+    let t = x.len() / cfg.hidden_size;
+    let d = cfg.hidden_size;
+    let e = cfg.num_experts;
+    let k = cfg.top_k;
+    let inter = cfg.intermediate_size;
+    if x.len() != t * d {
+        return Err(SentinelError::InvalidState("moe_ffn_kernels: bad x len".into()));
+    }
+
+    let mut router_logits = kernels.gemm(x, &moe.router, t, d, e).map_err(kerr)?;
+    softmax_rows(&mut router_logits, t, e);
+
+    let mut choices: Vec<Vec<(usize, f32)>> = Vec::with_capacity(t);
+    for row in 0..t {
+        choices.push(top_k_row(&router_logits[row * e..(row + 1) * e], k));
+    }
+
+    let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); e];
+    let mut expert_weights: Vec<Vec<f32>> = vec![Vec::new(); e];
+    for (tok, ch) in choices.iter().enumerate() {
+        for &(ei, w) in ch {
+            expert_tokens[ei].push(tok);
+            expert_weights[ei].push(w);
+        }
+    }
+
+    let mut out = vec![0.0f32; t * d];
+
+    for ei in 0..e {
+        let idxs = &expert_tokens[ei];
+        if idxs.is_empty() {
+            continue;
+        }
+        let n = idxs.len();
+        let mut packed = vec![0.0f32; n * d];
+        for (j, &tok) in idxs.iter().enumerate() {
+            packed[j * d..(j + 1) * d].copy_from_slice(&x[tok * d..(tok + 1) * d]);
+        }
+        let ex = &moe.experts[ei];
+        let mut gate = kernels.gemm(&packed, &ex.w_gate, n, d, inter).map_err(kerr)?;
+        let up = kernels.gemm(&packed, &ex.w_up, n, d, inter).map_err(kerr)?;
+        kern::silu_inplace(&mut gate).map_err(kerr)?;
+        for i in 0..gate.len() {
+            gate[i] *= up[i];
+        }
+        let y = kernels.gemm(&gate, &ex.w_down, n, inter, d).map_err(kerr)?;
+
+        for (j, &tok) in idxs.iter().enumerate() {
+            let w = expert_weights[ei][j];
+            for c in 0..d {
+                out[tok * d + c] += w * y[j * d + c];
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Dense SwiGLU via kernel GEMMs (GPU when available).
+pub fn dense_swiglu_kernels(
+    x: &[f32],
+    w_gate: &[f32],
+    w_up: &[f32],
+    w_down: &[f32],
+    tokens: usize,
+    hidden: usize,
+    intermediate: usize,
+    kernels: &sentinel_kernels::SeekKernels,
+) -> Result<Vec<f32>> {
+    let mut gate = kernels.gemm(x, w_gate, tokens, hidden, intermediate).map_err(kerr)?;
+    let up = kernels.gemm(x, w_up, tokens, hidden, intermediate).map_err(kerr)?;
+    kern::silu_inplace(&mut gate).map_err(kerr)?;
+    for i in 0..gate.len() {
+        gate[i] *= up[i];
+    }
+    kernels.gemm(&gate, w_down, tokens, intermediate, hidden).map_err(kerr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +346,23 @@ mod tests {
         let moe = MoEWeights::random(&cfg, 7).unwrap();
         let x = vec![0.1f32; 3 * cfg.hidden_size];
         let y = moe_ffn(&x, &moe).unwrap();
+        assert_eq!(y.len(), 3 * cfg.hidden_size);
+        assert!(y.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn moe_ffn_kernels_matches_cpu_shape() {
+        let cfg = MoEConfig {
+            num_experts: 4,
+            top_k: 2,
+            intermediate_size: 16,
+            hidden_size: 8,
+            ep: Default::default(),
+        };
+        let moe = MoEWeights::random(&cfg, 7).unwrap();
+        let x = vec![0.1f32; 3 * cfg.hidden_size];
+        let k = sentinel_kernels::SeekKernels::cpu();
+        let y = moe_ffn_kernels(&x, &moe, &k).unwrap();
         assert_eq!(y.len(), 3 * cfg.hidden_size);
         assert!(y.iter().all(|v| v.is_finite()));
     }
