@@ -4,12 +4,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 license = "Apache-2.0"
-description = "Sentinel kernels: CPU reference, parallel CPU, OpenCL GPU (runtime libOpenCL)"
-
-[dependencies]
-# OpenCL is loaded at runtime via dlopen — no link-time dependency required.
+description = "SeekKernels — unified Seek-V kernel pipeline"
 
 [features]
 default = []
-# Optional: document intent to use vendor CUDA SO via SENTINEL_VENDOR_SO
 cuda-vendor = []

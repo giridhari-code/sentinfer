@@ -1,3 +1,7 @@
+# Prefer SeekKernels
+
+See **SEEK_KERNELS.md**. Pipeline internals remain under `pipeline` (private to the facade).
+
 # Full kernel pipeline (sentinel-kernels)
 
 ## What’s on *your* kernels today
