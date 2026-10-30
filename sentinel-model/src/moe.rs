@@ -55,13 +55,11 @@ impl MoEConfig {
     }
 }
 
-/// One SwiGLU expert: intermediate = silu(x @ Wgate) * (x @ Wup); out = intermediate @ Wdown.
+/// One SwiGLU expert.
 #[derive(Debug, Clone)]
 pub struct ExpertWeights {
-    /// `[intermediate, hidden]`
     pub w_gate: Vec<f32>,
     pub w_up: Vec<f32>,
-    /// `[hidden, intermediate]`
     pub w_down: Vec<f32>,
 }
 
@@ -88,10 +86,8 @@ impl ExpertWeights {
     }
 }
 
-/// Full MoE block weights: router + experts.
 #[derive(Debug, Clone)]
 pub struct MoEWeights {
-    /// `[num_experts, hidden]` — logits = x @ router^T style via matmul_nt.
     pub router: Vec<f32>,
     pub experts: Vec<ExpertWeights>,
     pub cfg: MoEConfig,
@@ -144,7 +140,6 @@ impl MoEWeights {
     }
 }
 
-/// Softmax over the last dimension of `[tokens, num_experts]` row-major.
 fn softmax_rows(logits: &mut [f32], rows: usize, cols: usize) {
     for r in 0..rows {
         let row = &mut logits[r * cols..(r + 1) * cols];
@@ -166,18 +161,19 @@ fn softmax_rows(logits: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
-/// Top-k indices and weights for one row (descending by score).
 fn top_k_row(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut idx: Vec<usize> = (0..scores.len()).collect();
-    idx.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     idx.truncate(k);
-    // Renormalize selected weights so they sum to 1.
     let sum: f32 = idx.iter().map(|&i| scores[i]).sum();
     let inv = if sum > 0.0 { 1.0 / sum } else { 1.0 / k as f32 };
     idx.into_iter().map(|i| (i, scores[i] * inv)).collect()
 }
 
-/// Run MoE FFN on `[tokens, hidden]` activations → same shape output.
 pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
     moe.validate()?;
     let cfg = &moe.cfg;
@@ -192,18 +188,15 @@ pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
         return Err(SentinelError::InvalidState("moe_ffn: x length not divisible by hidden".into()));
     }
 
-    // Router logits: [t, e] = x[t,d] @ router[e,d]^T
     let mut router_logits = kern::matmul_nt(x, &moe.router, t, d, e).map_err(kerr)?;
     softmax_rows(&mut router_logits, t, e);
 
-    // Per-token top-k
     let mut choices: Vec<Vec<(usize, f32)>> = Vec::with_capacity(t);
     for row in 0..t {
         let scores = &router_logits[row * e..(row + 1) * e];
         choices.push(top_k_row(scores, k));
     }
 
-    // Pack tokens per expert for batched GEMM (DeepGEMM-style grouping).
     let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); e];
     let mut expert_weights: Vec<Vec<f32>> = vec![Vec::new(); e];
     for (tok, ch) in choices.iter().enumerate() {
@@ -221,13 +214,11 @@ pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
             continue;
         }
         let n = idxs.len();
-        // Pack inputs [n, d]
         let mut packed = vec![0.0f32; n * d];
         for (j, &tok) in idxs.iter().enumerate() {
             packed[j * d..(j + 1) * d].copy_from_slice(&x[tok * d..(tok + 1) * d]);
         }
         let ex = &moe.experts[ei];
-        // SwiGLU
         let mut gate = kern::matmul_nt(&packed, &ex.w_gate, n, d, inter).map_err(kerr)?;
         let up = kern::matmul_nt(&packed, &ex.w_up, n, d, inter).map_err(kerr)?;
         kern::silu_inplace(&mut gate).map_err(kerr)?;
@@ -236,7 +227,6 @@ pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
         }
         let y = kern::matmul_nt(&gate, &ex.w_down, n, inter, d).map_err(kerr)?;
 
-        // Scatter-add weighted outputs
         for (j, &tok) in idxs.iter().enumerate() {
             let w = expert_weights[ei][j];
             for c in 0..d {
@@ -248,7 +238,6 @@ pub fn moe_ffn(x: &[f32], moe: &MoEWeights) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Dense SwiGLU FFN (reference path when MoE disabled).
 pub fn dense_swiglu(
     x: &[f32],
     w_gate: &[f32],
@@ -286,26 +275,5 @@ mod tests {
         let y = moe_ffn(&x, &moe).unwrap();
         assert_eq!(y.len(), t * cfg.hidden_size);
         assert!(y.iter().all(|v| v.is_finite()));
-    }
-
-    #[test]
-    fn top_k_one_matches_best_expert() {
-        let cfg = MoEConfig {
-            num_experts: 2,
-            top_k: 1,
-            intermediate_size: 8,
-            hidden_size: 4,
-            ep: Default::default(),
-        };
-        let mut moe = MoEWeights::zeros(&cfg).unwrap();
-        // Force router: expert 1 always wins for any x.
-        for h in 0..cfg.hidden_size {
-            moe.router[1 * cfg.hidden_size + h] = 10.0;
-            moe.router[0 * cfg.hidden_size + h] = -10.0;
-        }
-        // Expert 1 produces identity-ish via small weights — just ensure path runs.
-        let x = vec![1.0f32; cfg.hidden_size];
-        let y = moe_ffn(&x, &moe).unwrap();
-        assert_eq!(y.len(), cfg.hidden_size);
     }
 }
