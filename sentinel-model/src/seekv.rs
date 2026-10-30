@@ -1,9 +1,7 @@
-//! Seek-V: a decoder-only transformer (RMSNorm, rotary embeddings, grouped-query attention,
-//! SwiGLU MLP) running on CPU in f32.
+//! Seek-V: decoder-only transformer (RMSNorm, RoPE, GQA, dense or MoE SwiGLU).
 //!
-//! This is a reference implementation: the KV cache is contiguous per sequence (the scheduler's
-//! block table is used for capacity accounting only), and weights are random unless you supply
-//! trained ones. It exists to define the model interface and to exercise the whole engine.
+//! Dense MLP by default. Set `num_experts > 0` for DeepInfer-style sparse FFN
+//! (router + top-k experts, DeepGEMM-style packed expert GEMMs).
 
 use std::collections::HashMap;
 
@@ -24,6 +22,10 @@ pub struct SeekVConfig {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub intermediate_size: usize,
+    /// 0 = dense MLP. >0 enables MoE FFN.
+    pub num_experts: usize,
+    /// Top-k experts per token (when MoE on).
+    pub num_experts_per_tok: usize,
     pub rope_theta: f32,
     pub rms_eps: f32,
     pub max_positions: usize,
@@ -40,6 +42,8 @@ impl SeekVConfig {
             num_kv_heads: 2,
             head_dim: 8,
             intermediate_size: 64,
+            num_experts: 0,
+            num_experts_per_tok: 1,
             rope_theta: 10000.0,
             rms_eps: 1e-6,
             max_positions: 512,
@@ -56,6 +60,8 @@ impl SeekVConfig {
             num_kv_heads: 4,
             head_dim: 32,
             intermediate_size: 704,
+            num_experts: 0,
+            num_experts_per_tok: 1,
             rope_theta: 10000.0,
             rms_eps: 1e-6,
             max_positions: 512,
@@ -72,11 +78,25 @@ impl SeekVConfig {
             num_kv_heads: 1,
             head_dim: 4,
             intermediate_size: 12,
+            num_experts: 0,
+            num_experts_per_tok: 1,
             rope_theta: 10000.0,
             rms_eps: 1e-6,
             max_positions: 64,
             eos_token_id: vocab_size as i32 - 1,
         }
+    }
+
+    /// Tiny MoE demo: 4 experts, top-2.
+    pub fn tiny_moe() -> Self {
+        let mut c = Self::tiny();
+        c.num_experts = 4;
+        c.num_experts_per_tok = 2;
+        c
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 0
     }
 
     pub fn flops_config(&self) -> DecoderFlopsConfig {
@@ -105,6 +125,11 @@ impl SeekVConfig {
         if self.eos_token_id < 0 || self.eos_token_id as usize >= self.vocab_size {
             return bad("eos_token_id must be inside the vocabulary");
         }
+        if self.num_experts > 0
+            && (self.num_experts_per_tok == 0 || self.num_experts_per_tok > self.num_experts)
+        {
+            return bad("num_experts_per_tok must be in 1..=num_experts when MoE is on");
+        }
         Ok(())
     }
 }
@@ -128,13 +153,18 @@ pub struct SeekVWeights {
     pub layers: Vec<LayerWeights>,
     pub final_norm: Vec<f32>,
     pub lm_head: Vec<f32>,
+    /// Per-layer MoE when `cfg.num_experts > 0`.
+    pub moe: Option<Vec<crate::moe::MoEWeights>>,
 }
 
 impl SeekVWeights {
     pub fn random(cfg: &SeekVConfig, seed: u64) -> Self {
         let mut rng = SplitMix::new(seed);
-        let mut mat = |rows: usize, cols: usize| -> Vec<f32> { (0..rows * cols).map(|_| rng.uniform(-0.1, 0.1)).collect() };
-        let (d, h, hk, hd, inter) = (cfg.hidden_size, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.intermediate_size);
+        let mut mat = |rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols).map(|_| rng.uniform(-0.1, 0.1)).collect()
+        };
+        let (d, h, hk, hd, inter) =
+            (cfg.hidden_size, cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, cfg.intermediate_size);
         let embed = mat(cfg.vocab_size, d);
         let layers = (0..cfg.num_layers)
             .map(|_| LayerWeights {
@@ -150,7 +180,31 @@ impl SeekVWeights {
             })
             .collect();
         let lm_head = mat(cfg.vocab_size, d);
-        Self { embed, layers, final_norm: vec![1.0; d], lm_head }
+        let moe = if cfg.is_moe() {
+            let mcfg = crate::moe::MoEConfig {
+                num_experts: cfg.num_experts,
+                top_k: cfg.num_experts_per_tok,
+                intermediate_size: cfg.intermediate_size,
+                hidden_size: cfg.hidden_size,
+                ep: Default::default(),
+            };
+            Some(
+                (0..cfg.num_layers)
+                    .map(|i| {
+                        crate::moe::MoEWeights::random(&mcfg, seed + 100 + i as u64).expect("moe")
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        Self {
+            embed,
+            layers,
+            final_norm: vec![1.0; d],
+            lm_head,
+            moe,
+        }
     }
 
     pub fn zeros(cfg: &SeekVConfig) -> Self {
@@ -242,6 +296,17 @@ impl SeekVWeights {
             check(&format!("layers.{i}.w_up"), l.w_up.len(), inter * d)?;
             check(&format!("layers.{i}.w_down"), l.w_down.len(), d * inter)?;
         }
+        if cfg.is_moe() {
+            let moe = self.moe.as_ref().ok_or_else(|| {
+                SentinelError::Config("MoE config set but weights.moe is None".into())
+            })?;
+            if moe.len() != cfg.num_layers {
+                return Err(SentinelError::Config("moe layers count mismatch".into()));
+            }
+            for m in moe {
+                m.validate()?;
+            }
+        }
         Ok(())
     }
 }
@@ -266,7 +331,12 @@ impl SeekV {
         let kernels = SeekKernels::parallel()
             .with_rope_theta(cfg.rope_theta)
             .with_rms_eps(cfg.rms_eps);
-        Ok(Self { cfg, w: weights, caches: HashMap::new(), kernels })
+        Ok(Self {
+            cfg,
+            w: weights,
+            caches: HashMap::new(),
+            kernels,
+        })
     }
 
     pub fn random(cfg: SeekVConfig, seed: u64) -> Result<Self> {
@@ -306,20 +376,31 @@ impl SeekV {
         if step.start_pos + t > self.cfg.max_positions {
             return Err(SentinelError::InvalidState(format!(
                 "sequence {}: positions {}..{} exceed max_positions {}",
-                step.seq_id, step.start_pos, step.start_pos + t, self.cfg.max_positions
+                step.seq_id,
+                step.start_pos,
+                step.start_pos + t,
+                self.cfg.max_positions
             )));
         }
         if let Some(bad) = step.tokens.iter().find(|&&tok| tok < 0 || tok as usize >= self.cfg.vocab_size) {
-            return Err(SentinelError::InvalidState(format!("sequence {}: token {bad} outside vocabulary", step.seq_id)));
+            return Err(SentinelError::InvalidState(format!(
+                "sequence {}: token {bad} outside vocabulary",
+                step.seq_id
+            )));
         }
 
         let mut cache = if step.start_pos == 0 {
-            KvCache { k: vec![Vec::new(); self.cfg.num_layers], v: vec![Vec::new(); self.cfg.num_layers], len: 0 }
+            KvCache {
+                k: vec![Vec::new(); self.cfg.num_layers],
+                v: vec![Vec::new(); self.cfg.num_layers],
+                len: 0,
+            }
         } else {
             match self.caches.get(&step.seq_id) {
                 None => {
                     return Err(SentinelError::InvalidState(format!(
-                        "sequence {}: no KV cache but start_pos = {}", step.seq_id, step.start_pos
+                        "sequence {}: no KV cache but start_pos = {}",
+                        step.seq_id, step.start_pos
                     )))
                 }
                 Some(c) if c.len != step.start_pos => {
@@ -336,8 +417,12 @@ impl SeekV {
         };
 
         let (d, h, hk, hd, inter, vocab) = (
-            self.cfg.hidden_size, self.cfg.num_heads, self.cfg.num_kv_heads, self.cfg.head_dim,
-            self.cfg.intermediate_size, self.cfg.vocab_size,
+            self.cfg.hidden_size,
+            self.cfg.num_heads,
+            self.cfg.num_kv_heads,
+            self.cfg.head_dim,
+            self.cfg.intermediate_size,
+            self.cfg.vocab_size,
         );
         let (eps, start) = (self.cfg.rms_eps, step.start_pos);
         let kv_stride = hk * hd;
@@ -350,31 +435,128 @@ impl SeekV {
         }
 
         let dims = ModelDims {
-            tokens: t, start_pos: start, hidden: d, num_heads: h, num_kv_heads: hk,
-            head_dim: hd, intermediate: inter, vocab, rms_eps: eps,
+            tokens: t,
+            start_pos: start,
+            hidden: d,
+            num_heads: h,
+            num_kv_heads: hk,
+            head_dim: hd,
+            intermediate: inter,
+            vocab,
+            rms_eps: eps,
         };
+        let use_moe = w.moe.is_some();
         for (l, lw) in w.layers.iter().enumerate() {
             let mut layer_cache = LayerKvCache {
                 k: std::mem::take(&mut cache.k[l]),
                 v: std::mem::take(&mut cache.v[l]),
                 len: start,
             };
-            let kw = KernLayerWeights {
-                attn_norm: &lw.attn_norm, wq: &lw.wq, wk: &lw.wk, wv: &lw.wv, wo: &lw.wo,
-                mlp_norm: &lw.mlp_norm, w_gate: &lw.w_gate, w_up: &lw.w_up, w_down: &lw.w_down,
-            };
-            self.kernels.layer(&mut x, dims, &kw, &mut layer_cache).map_err(kerr)?;
+            if use_moe {
+                Self::layer_attn_then_moe(
+                    &mut x,
+                    lw,
+                    w.moe.as_ref().unwrap().get(l).expect("moe layer"),
+                    &mut layer_cache,
+                    t,
+                    start,
+                    d,
+                    h,
+                    hk,
+                    hd,
+                    eps,
+                    self.cfg.rope_theta,
+                )?;
+            } else {
+                let kw = KernLayerWeights {
+                    attn_norm: &lw.attn_norm,
+                    wq: &lw.wq,
+                    wk: &lw.wk,
+                    wv: &lw.wv,
+                    wo: &lw.wo,
+                    mlp_norm: &lw.mlp_norm,
+                    w_gate: &lw.w_gate,
+                    w_up: &lw.w_up,
+                    w_down: &lw.w_down,
+                };
+                self.kernels.layer(&mut x, dims, &kw, &mut layer_cache).map_err(kerr)?;
+            }
             let end = layer_cache.len * kv_stride;
             cache.k[l] = layer_cache.k[..end.min(layer_cache.k.len())].to_vec();
             cache.v[l] = layer_cache.v[..end.min(layer_cache.v.len())].to_vec();
         }
 
-        let (last, _) = kern::rms_norm(&x[(t - 1) * d..t * d], &w.final_norm, None, 1, d, eps).map_err(kerr)?;
+        let (last, _) =
+            kern::rms_norm(&x[(t - 1) * d..t * d], &w.final_norm, None, 1, d, eps).map_err(kerr)?;
         let logits = self.kernels.gemm(&last, &w.lm_head, 1, d, vocab).map_err(kerr)?;
 
         cache.len = start + t;
         self.caches.insert(step.seq_id, cache);
         Ok(logits)
+    }
+
+    /// Attention then MoE FFN + residuals.
+    fn layer_attn_then_moe(
+        x: &mut [f32],
+        lw: &LayerWeights,
+        moe: &crate::moe::MoEWeights,
+        cache: &mut LayerKvCache,
+        t: usize,
+        start: usize,
+        d: usize,
+        h: usize,
+        hk: usize,
+        hd: usize,
+        eps: f32,
+        rope_theta: f32,
+    ) -> Result<()> {
+        let residual = x.to_vec();
+        let (h_in, _) = kern::rms_norm(x, &lw.attn_norm, None, t, d, eps).map_err(kerr)?;
+        let mut q = kern::matmul_nt(&h_in, &lw.wq, t, d, h * hd).map_err(kerr)?;
+        let mut k = kern::matmul_nt(&h_in, &lw.wk, t, d, hk * hd).map_err(kerr)?;
+        let mut v = kern::matmul_nt(&h_in, &lw.wv, t, d, hk * hd).map_err(kerr)?;
+        kern::rope_inplace(&mut q, t, h, hd, start, rope_theta).map_err(kerr)?;
+        kern::rope_inplace(&mut k, t, hk, hd, start, rope_theta).map_err(kerr)?;
+
+        let total = start + t;
+        let stride = hk * hd;
+        let need = total * stride;
+        if cache.k.len() < need {
+            cache.k.resize(need, 0.0);
+            cache.v.resize(need, 0.0);
+        }
+        for i in 0..t {
+            let pos = start + i;
+            let dst = pos * stride;
+            cache.k[dst..dst + stride].copy_from_slice(&k[i * stride..(i + 1) * stride]);
+            cache.v[dst..dst + stride].copy_from_slice(&v[i * stride..(i + 1) * stride]);
+        }
+        cache.len = total;
+
+        let attn = kern::attention_causal(
+            &q,
+            &cache.k[..total * stride],
+            &cache.v[..total * stride],
+            t,
+            start,
+            h,
+            hk,
+            hd,
+        )
+        .map_err(kerr)?;
+        let mut attn_out = kern::matmul_nt(&attn, &lw.wo, t, h * hd, d).map_err(kerr)?;
+        for (a, b) in attn_out.iter_mut().zip(residual.iter()) {
+            *a += *b;
+        }
+
+        let residual2 = attn_out.clone();
+        let (h2, _) = kern::rms_norm(&attn_out, &lw.mlp_norm, None, t, d, eps).map_err(kerr)?;
+        let mut mlp = crate::moe::moe_ffn(&h2, moe)?;
+        for (a, b) in mlp.iter_mut().zip(residual2.iter()) {
+            *a += *b;
+        }
+        x.copy_from_slice(&mlp);
+        Ok(())
     }
 }
 
@@ -432,7 +614,11 @@ mod tests {
     }
 
     fn step(seq_id: SeqId, tokens: &[i32], start_pos: usize) -> StepInput<'_> {
-        StepInput { seq_id, tokens, start_pos }
+        StepInput {
+            seq_id,
+            tokens,
+            start_pos,
+        }
     }
 
     #[test]
@@ -450,5 +636,14 @@ mod tests {
         assert_eq!(m.kv_len(1), 4);
         m.truncate(1, 2);
         assert_eq!(m.kv_len(1), 2);
+    }
+
+    #[test]
+    fn moe_forward_runs() {
+        let mut m = SeekV::random(SeekVConfig::tiny_moe(), 99).unwrap();
+        assert!(m.config().is_moe());
+        let logits = m.forward(&[step(1, &[1, 2, 3], 0)]).unwrap();
+        assert_eq!(logits.len(), 258);
+        assert!(logits.iter().all(|x| x.is_finite()));
     }
 }
