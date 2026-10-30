@@ -1,0 +1,5 @@
+Sentinel kernels (sentinel-kernels)
+
+The operator semantics in src/reference.rs are ported from the *_ref reference functions in
+DeepInfer (https://github.com/deepseek-ai/DeepInfer), Copyright DeepSeek-AI, licensed under
+the Apache License, Version 2.0 (deepinfer/model_executor/layers/tilelang_ops/).
