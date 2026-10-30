@@ -1,0 +1,11 @@
+[package]
+name = "sentinel-train"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "Apache-2.0"
+description = "Training pipeline for Seek-V: backward pass, AdamW, data, checkpoints, CLI"
+
+[dependencies]
+sentinel-core = { path = ".." }
+sentinel-model = { path = "../sentinel-model" }
