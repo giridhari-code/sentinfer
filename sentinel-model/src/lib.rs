@@ -23,7 +23,10 @@ pub use distributed::{Coordinator, Worker};
 pub use engine::{Engine, FinishedRequest, GenerationParams};
 pub use llm::{Llm, StreamDelta};
 pub use model::{Model, StepInput};
-pub use moe::{moe_ffn, dense_swiglu, ExpertParallelConfig, ExpertWeights, MoEConfig, MoEWeights};
+pub use moe::{
+    dense_swiglu, dense_swiglu_kernels, moe_ffn, moe_ffn_kernels, ExpertParallelConfig,
+    ExpertWeights, MoEConfig, MoEWeights,
+};
 pub use mtp_decode::{greedy_token, propose_drafts, verify_drafts, VerifyResult};
 pub use quantized::{quantize_checkpoint, QuantizedSeekV};
 pub use request::{CompletionRequest, RequestOutput, SamplingParams};
