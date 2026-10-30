@@ -1,50 +1,20 @@
-# SeekKernels — senior research / engineering pipeline
+# SeekKernels
 
-One public kernel object. Everything else is implementation detail.
-
-```text
-┌──────────────────────────────────────────────────────────┐
-│                     SeekKernels                          │
-│   cpu()  ·  parallel()  ·  gpu()                         │
-└────────────┬─────────────────────────────┬───────────────┘
-             │                             │
-     primitives                      full stack
-     gemm / sample                   layer → forward
-             │                             │
-             ▼                             ▼
-┌─────────────────────┐     ┌──────────────────────────────┐
-│ Backend             │     │ Decoder pipeline             │
-│ CPU | Parallel | GPU│     │ RMS → QKV → RoPE → Attn →   │
-│                     │     │ O → residual → SwiGLU → …   │
-│                     │     │ → final norm → lm_head      │
-│                     │     │ → sample                    │
-└─────────────────────┘     └──────────────────────────────┘
-```
-
-## API
+One public API for Seek-V kernels.
 
 ```rust
 use sentinel_kernels::{SeekKernels, ModelDims, LayerWeights, LayerKvCache};
 
-let k = SeekKernels::parallel(); // or ::cpu() / ::gpu()
-
-// one block
-k.layer(&mut x, dims, &weights, &mut cache)?;
-
-// full model step
-let (logits, tokens) = k.forward(
-    x, dims, &layers, &mut caches, final_norm, lm_head, Some((0.0, 42)),
-)?;
+let k = SeekKernels::parallel(); // or cpu() / gpu()
+k.layer(&mut x, dims, &w, &mut cache)?;
+let (logits, tokens) = k.forward(x, dims, &layers, &mut caches, final_norm, lm_head, Some((0.0, 1)))?;
 ```
 
-## Design rules
+| Method | Role |
+| --- | --- |
+| `layer` | One decoder block + KV |
+| `forward` | Full stack + optional sample |
+| `gemm` | Matmul primitive |
+| `sample` | Token from logits |
 
-1. **One name** — `SeekKernels` is the product surface.
-2. **Oracle path** — CPU/parallel `layer`/`forward` use the reference decoder math.
-3. **Device path** — `gpu()` runs the same pipeline through the Backend trait.
-4. **No scattered public kernels** — MLA/MoE/TP/quant live as internal modules; call via SeekKernels or keep rare escapes (`reference`, `quant`) for training/compat only.
-
-## Not the public surface anymore
-
-`flash_mla`, `moe`, `tensor_parallel`, `deep_gemm`, `cuda_vendor` — internal.
-Wire them into `SeekKernels` methods only when a research experiment needs them.
+Internals (`reference`, OpenCL, quant, TP) are not the product surface.

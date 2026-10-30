@@ -1,28 +1,18 @@
 //! # SeekKernels
 //!
-//! One kernel surface for Seek-V research & engineering:
-//! backends → decoder ops → full forward pipeline → sample.
+//! Unified kernel surface for Seek-V: device → layer → forward → sample.
 //!
 //! ```ignore
-//! use sentinel_kernels::SeekKernels;
 //! let k = SeekKernels::parallel();
-//! let logits = k.forward(/* ... */)?;
+//! let (logits, ids) = k.forward(...)?;
 //! ```
-//!
-//! Internal modules are implementation detail (reference math, OpenCL, TP, quant).
-
-#![allow(dead_code)]
 
 pub mod backend;
 pub(crate) mod conformance;
 pub(crate) mod cpu;
-pub(crate) mod cuda_vendor;
-pub(crate) mod deep_gemm;
 pub mod error;
-pub(crate) mod flash_mla;
 pub mod gpu;
 pub(crate) mod gpu_opencl;
-pub(crate) mod moe;
 pub(crate) mod opencl_ffi;
 pub(crate) mod parallel_cpu;
 pub(crate) mod pipeline;
@@ -30,20 +20,19 @@ pub mod quant;
 pub mod reference;
 pub(crate) mod tensor_parallel;
 
-pub use error::{KernelError, Result};
-
-// --- Compatibility exports (prefer SeekKernels for new code) ---
-pub use quant::{QuantMatrix, QuantScheme};
 pub use backend::Backend;
+pub use error::{KernelError, Result};
 pub use gpu::GpuBackend;
 pub use pipeline::LayerKvCache;
+pub use quant::{QuantMatrix, QuantScheme};
 
-
+use backend::Backend as _;
 use cpu::CpuBackend;
+use gpu::GpuBackend as Gpu;
 use parallel_cpu::ParallelCpuBackend;
-use pipeline::{run_forward, run_layer, LayerWeightsView, PipelineDims};
+use pipeline::{run_forward, run_layer, run_layer_backend, LayerWeightsView, PipelineDims};
 
-/// Layer weights borrowed for one decoder block (row-major `matmul_nt` layout).
+/// Borrowed weights for one decoder block (`matmul_nt` layout `[out, in]`).
 pub struct LayerWeights<'a> {
     pub attn_norm: &'a [f32],
     pub wq: &'a [f32],
@@ -56,7 +45,23 @@ pub struct LayerWeights<'a> {
     pub w_down: &'a [f32],
 }
 
-/// Model-level dims for a forward step.
+impl<'a> LayerWeights<'a> {
+    fn view(&self) -> LayerWeightsView<'a> {
+        LayerWeightsView {
+            attn_norm: self.attn_norm,
+            wq: self.wq,
+            wk: self.wk,
+            wv: self.wv,
+            wo: self.wo,
+            mlp_norm: self.mlp_norm,
+            w_gate: self.w_gate,
+            w_up: self.w_up,
+            w_down: self.w_down,
+        }
+    }
+}
+
+/// Step geometry for layer / forward.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelDims {
     pub tokens: usize,
@@ -84,38 +89,29 @@ impl From<ModelDims> for PipelineDims {
     }
 }
 
-enum BackendKind {
+enum Kind {
     Cpu(CpuBackend),
     Parallel(ParallelCpuBackend),
-    Gpu(GpuBackend),
+    Gpu(Gpu),
 }
 
-/// **SeekKernels** — single entry for all kernel work.
-///
-/// Research pipeline:
-/// 1. Choose device (`cpu` / `parallel` / `gpu`)
-/// 2. `layer` — one transformer block + KV cache
-/// 3. `forward` — full stack → logits (+ optional sample)
-/// 4. `gemm` / `rms` / `sample` — primitive escapes when needed
+/// Single kernel engine for Seek-V research and production paths.
 pub struct SeekKernels {
-    kind: BackendKind,
+    kind: Kind,
     rope_theta: f32,
 }
 
 impl SeekKernels {
-    /// Scalar CPU (correctness / debug).
     pub fn cpu() -> Self {
-        Self { kind: BackendKind::Cpu(CpuBackend), rope_theta: 10_000.0 }
+        Self { kind: Kind::Cpu(CpuBackend), rope_theta: 10_000.0 }
     }
 
-    /// Multi-core CPU (default engineering path).
     pub fn parallel() -> Self {
-        Self { kind: BackendKind::Parallel(ParallelCpuBackend), rope_theta: 10_000.0 }
+        Self { kind: Kind::Parallel(ParallelCpuBackend), rope_theta: 10_000.0 }
     }
 
-    /// OpenCL GPU if present, else parallel CPU.
     pub fn gpu() -> Self {
-        Self { kind: BackendKind::Gpu(GpuBackend::new()), rope_theta: 10_000.0 }
+        Self { kind: Kind::Gpu(Gpu::new()), rope_theta: 10_000.0 }
     }
 
     pub fn with_rope_theta(mut self, theta: f32) -> Self {
@@ -125,20 +121,17 @@ impl SeekKernels {
 
     pub fn name(&self) -> &'static str {
         match &self.kind {
-            BackendKind::Cpu(b) => b.name(),
-            BackendKind::Parallel(b) => b.name(),
-            BackendKind::Gpu(b) => b.name(),
+            Kind::Cpu(b) => b.name(),
+            Kind::Parallel(b) => b.name(),
+            Kind::Gpu(b) => b.name(),
         }
     }
 
     pub fn is_accelerated(&self) -> bool {
-        match &self.kind {
-            BackendKind::Gpu(b) => b.is_device_accelerated(),
-            _ => false,
-        }
+        matches!(&self.kind, Kind::Gpu(b) if b.is_device_accelerated())
     }
 
-    /// One decoder layer; updates `x` in place and extends `cache`.
+    /// One transformer block; writes residual stream `x` and updates KV `cache`.
     pub fn layer(
         &self,
         x: &mut [f32],
@@ -147,31 +140,14 @@ impl SeekKernels {
         cache: &mut LayerKvCache,
     ) -> Result<()> {
         let pd = dims.into();
-        let view = LayerWeightsView {
-            attn_norm: w.attn_norm,
-            wq: w.wq,
-            wk: w.wk,
-            wv: w.wv,
-            wo: w.wo,
-            mlp_norm: w.mlp_norm,
-            w_gate: w.w_gate,
-            w_up: w.w_up,
-            w_down: w.w_down,
-        };
-        // Reference path is the research oracle; backend path for device parity tests.
+        let view = w.view();
         match &self.kind {
-            BackendKind::Cpu(_) | BackendKind::Parallel(_) => {
-                run_layer(x, &pd, &view, cache, self.rope_theta)
-            }
-            BackendKind::Gpu(b) => {
-                pipeline::run_layer_backend(b, x, &pd, &view, cache, self.rope_theta)
-            }
+            Kind::Gpu(b) => run_layer_backend(b, x, &pd, &view, cache, self.rope_theta),
+            _ => run_layer(x, &pd, &view, cache, self.rope_theta),
         }
     }
 
-    /// Full research forward: N layers → final RMSNorm → lm_head → optional greedy/sample.
-    ///
-    /// Returns `(logits[vocab], optional token ids)`.
+    /// Full stack: layers → final norm → lm_head → optional sample.
     pub fn forward(
         &self,
         x: Vec<f32>,
@@ -180,76 +156,41 @@ impl SeekKernels {
         caches: &mut [LayerKvCache],
         final_norm: &[f32],
         lm_head: &[f32],
-        sample_temp_seed: Option<(f32, u64)>,
+        sample: Option<(f32, u64)>,
     ) -> Result<(Vec<f32>, Option<Vec<i32>>)> {
         let pd = dims.into();
-        let views: Vec<LayerWeightsView<'_>> = layers
-            .iter()
-            .map(|w| LayerWeightsView {
-                attn_norm: w.attn_norm,
-                wq: w.wq,
-                wk: w.wk,
-                wv: w.wv,
-                wo: w.wo,
-                mlp_norm: w.mlp_norm,
-                w_gate: w.w_gate,
-                w_up: w.w_up,
-                w_down: w.w_down,
-            })
-            .collect();
-        run_forward(
-            x,
-            &pd,
-            &views,
-            caches,
-            final_norm,
-            lm_head,
-            self.rope_theta,
-            sample_temp_seed,
-        )
+        let views: Vec<_> = layers.iter().map(LayerWeights::view).collect();
+        run_forward(x, &pd, &views, caches, final_norm, lm_head, self.rope_theta, sample)
     }
 
-    /// Primitive GEMM `X[m,k] @ W[n,k]^T`.
+    /// `X[m,k] @ W[n,k]^T`.
     pub fn gemm(&self, x: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
         match &self.kind {
-            BackendKind::Cpu(b) => {
-                let y = b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n)?;
-                b.download(&y)
-            }
-            BackendKind::Parallel(b) => {
-                let y = b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n)?;
-                b.download(&y)
-            }
-            BackendKind::Gpu(b) => {
-                let y = b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n)?;
-                b.download(&y)
-            }
+            Kind::Cpu(b) => download_gemm(b, x, w, m, k, n),
+            Kind::Parallel(b) => download_gemm(b, x, w, m, k, n),
+            Kind::Gpu(b) => download_gemm(b, x, w, m, k, n),
         }
     }
 
-    /// Fused top-p/top-k + sample one row of logits.
-    pub fn sample(
-        &self,
-        logits: &mut [f32],
-        vocab: usize,
-        temperature: f32,
-        seed: u64,
-    ) -> Result<i32> {
+    /// Greedy/sample one token from a logits row (`vocab` long).
+    pub fn sample(&self, logits: &mut [f32], vocab: usize, temperature: f32, seed: u64) -> Result<i32> {
         let ids = reference::fused_sample(logits, &[1.0], &[-1], 1, vocab, temperature, seed)?;
         Ok(ids[0])
     }
 }
 
-// Public types needed to drive the pipeline without exposing internals.
+fn download_gemm<B: Backend>(b: &B, x: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
+    let y = b.matmul_nt(&b.upload(x)?, &b.upload(w)?, m, k, n)?;
+    b.download(&y)
+}
 
 #[cfg(test)]
-mod seek_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn seek_kernels_forward_smoke() {
+    fn forward_smoke() {
         let k = SeekKernels::parallel();
-        assert!(!k.name().is_empty());
         let dims = ModelDims {
             tokens: 2,
             start_pos: 0,
@@ -262,16 +203,17 @@ mod seek_tests {
         };
         let d = dims.hidden;
         let inter = dims.intermediate;
-        let an = vec![1.0f32; d];
-        let mn = vec![1.0f32; d];
-        let small = |n: usize, s: f32| (0..n).map(|i| ((i as f32) * s).sin() * 0.05).collect::<Vec<_>>();
-        let wq = small(dims.num_heads * dims.head_dim * d, 0.01);
-        let wk = small(dims.num_kv_heads * dims.head_dim * d, 0.02);
-        let wv = small(dims.num_kv_heads * dims.head_dim * d, 0.03);
-        let wo = small(d * dims.num_heads * dims.head_dim, 0.01);
-        let wg = small(inter * d, 0.02);
-        let wu = small(inter * d, 0.03);
-        let wd = small(d * inter, 0.01);
+        let ones = |n| vec![1.0f32; n];
+        let s = |n, t: f32| (0..n).map(|i| ((i as f32) * t).sin() * 0.05).collect::<Vec<_>>();
+        let an = ones(d);
+        let mn = ones(d);
+        let wq = s(dims.num_heads * dims.head_dim * d, 0.01);
+        let wk = s(dims.num_kv_heads * dims.head_dim * d, 0.02);
+        let wv = s(dims.num_kv_heads * dims.head_dim * d, 0.03);
+        let wo = s(d * dims.num_heads * dims.head_dim, 0.01);
+        let wg = s(inter * d, 0.02);
+        let wu = s(inter * d, 0.03);
+        let wd = s(d * inter, 0.01);
         let layer = LayerWeights {
             attn_norm: &an,
             wq: &wq,
@@ -283,12 +225,19 @@ mod seek_tests {
             w_up: &wu,
             w_down: &wd,
         };
-        let final_n = vec![1.0f32; d];
-        let lm = small(dims.vocab * d, 0.001);
+        let final_n = ones(d);
+        let lm = s(dims.vocab * d, 0.001);
         let mut caches = vec![LayerKvCache::new()];
-        let x = vec![0.1f32; dims.tokens * d];
         let (logits, ids) = k
-            .forward(x, dims, &[layer], &mut caches, &final_n, &lm, Some((0.0, 1)))
+            .forward(
+                vec![0.1; dims.tokens * d],
+                dims,
+                &[layer],
+                &mut caches,
+                &final_n,
+                &lm,
+                Some((0.0, 1)),
+            )
             .unwrap();
         assert_eq!(logits.len(), dims.vocab);
         assert!(ids.is_some());
