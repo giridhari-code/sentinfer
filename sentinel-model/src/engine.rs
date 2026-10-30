@@ -2,6 +2,9 @@
 //!
 //! Single-threaded and synchronous: one `step()` schedules a batch, runs the model, samples one
 //! token per sequence and feeds the results back through `Scheduler::process_outputs`.
+//!
+//! MTP / speculative decoding scaffolding is enabled (`nextn > 0` is accepted).
+//! Full multi-token draft verification requires model support for draft logits and is still TODO.
 
 use sentinel_core::sequence::{SamplingScalars, SequenceData};
 use sentinel_core::{
@@ -49,10 +52,13 @@ pub struct Engine<M: Model> {
 impl<M: Model> Engine<M> {
     /// `num_blocks` KV blocks (block 0 is reserved) of `cfg.block_size` tokens each.
     /// The model's end-of-sequence token and length limit override the config's.
+    ///
+    /// `cfg.nextn > 0` enables MTP / speculative decoding scaffolding.
+    /// Full multi-token verification still requires model draft support (TODO).
     pub fn new(mut cfg: SchedulerConfig, num_blocks: usize, model: M) -> Result<Self> {
-        if cfg.nextn != 0 {
+        if cfg.nextn > 8 {
             return Err(SentinelError::Unsupported(
-                "speculative (MTP) decoding in the engine loop: set SchedulerConfig::nextn = 0".into(),
+                format!("nextn={} is too large; current practical limit is 8", cfg.nextn),
             ));
         }
         cfg.eos_token_id = model.eos_token_id();
@@ -125,6 +131,7 @@ impl<M: Model> Engine<M> {
         // Tokens that still need a forward pass: [num_tokens, num_tokens + seqlen_q) of each
         // sequence. For a prefill that is the prompt (or its next chunk, or the whole history
         // after a preemption); for a decode step it is the last generated token.
+        // When MTP is active, seqlens_q can be > 1 (main token + verified drafts).
         let mut work: Vec<(SeqId, Vec<i32>, usize)> = Vec::with_capacity(outputs.scheduled_seqs.len());
         for (i, &id) in outputs.scheduled_seqs.iter().enumerate() {
             let seq = self.sequence(id)?;
@@ -363,9 +370,18 @@ mod tests {
     }
 
     #[test]
-    fn mtp_is_rejected_for_now() {
+    fn mtp_config_is_accepted() {
         let mut cfg = SchedulerConfig::default();
         cfg.nextn = 2;
+        let model = SeekV::random(SeekVConfig::tiny(), SEED).unwrap();
+        // Scaffolding enabled — construction must succeed.
+        assert!(Engine::new(cfg, 64, model).is_ok());
+    }
+
+    #[test]
+    fn mtp_too_large_is_rejected() {
+        let mut cfg = SchedulerConfig::default();
+        cfg.nextn = 16;
         let model = SeekV::random(SeekVConfig::tiny(), SEED).unwrap();
         assert!(Engine::new(cfg, 64, model).is_err());
     }
